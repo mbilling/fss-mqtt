@@ -1,0 +1,55 @@
+[package]
+name = "fss-mqtt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Fast, keyboard-driven MQTT v5 explorer for the terminal"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["mqtt", "tui", "iot", "cli", "explorer"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Linux packages, built in the release workflow (cargo deb / cargo generate-rpm).
+[package.metadata.deb]
+maintainer = "fss-mqtt developers"
+section = "net"
+recommends = "ca-certificates"
+extended-description = """\
+Interactive terminal MQTT v5 client: a live topic tree you filter by typing \
+(MQTT patterns or plain text), the last messages per topic with user \
+properties, and a full-screen payload viewer (JSON, text, hex)."""
+assets = [
+    ["target/release/fss-mqtt", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/fss-mqtt/README.md", "644"],
+    ["LICENSE-MIT", "usr/share/doc/fss-mqtt/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/fss-mqtt/LICENSE-APACHE", "644"],
+]
+
+[package.metadata.generate-rpm]
+auto-req = "no"  # static (musl) binary
+assets = [
+    { source = "target/release/fss-mqtt", dest = "/usr/bin/fss-mqtt", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/fss-mqtt/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/fss-mqtt/LICENSE-MIT", mode = "644" },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/fss-mqtt/LICENSE-APACHE", mode = "644" },
+]

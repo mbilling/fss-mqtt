@@ -1,0 +1,135 @@
+# fss-mqtt
+
+A fast, keyboard-driven MQTT explorer for the terminal. Subscribe to a broker and get a
+live topic tree you narrow down just by typing.
+
+```
+ ✻ fss-mqtt  mqtt://localhost:1883  ● connected                      9 topics  21 msgs  412/s
+╭─ Topics ──────────────────────────────╮╭─ v1/plant/line1/temp ─────────────────────────╮
+│   ▾ v1                             19 ││ 3 msgs · last now · qos 1                     │
+│     ▾ plant                        18 ││                                               │
+│       ▾ line1                       6 ││ Messages                                      │
+│         • status = RUNNING          3 ││ › 17:59:19.363   49 B  {"t":22.5,"ok":true,…  │
+│ ❯       • temp = {"t":22.5,"ok":…   3 ││   17:59:18.912   49 B  {"t":21.5,"ok":true,…  │
+│     ▸ camera (1)                    1 ││                                               │
+│                                       ││ Properties                                    │
+│                                       ││   content-type  application/json              │
+│                                       ││   site          oslo                          │
+│                                       ││ Payload · 49 B                                │
+│                                       ││   {"t":22.5,"ok":true,"tags":["a","b"],"no…   │
+╰───────────────────────────────────────╯╰───────────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────────────────────────────────╮
+│ > v1/+/line1                                                       pattern · 4 topics │
+╰───────────────────────────────────────────────────────────────────────────────────────╯
+  ↑↓ move  ·  ←→ collapse/expand  ·  ⏎ open  ·  esc clear filter  ·  ^w up a level  ·  ^c quit
+```
+
+## Install
+
+Pre-built binaries for Linux, macOS and Windows are on the GitHub releases page.
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./fss-mqtt_<version>-1_amd64.deb
+# Fedora / RHEL / openSUSE
+sudo dnf install ./fss-mqtt-<version>-1.x86_64.rpm
+# Homebrew (macOS, Linux)
+brew install <owner>/tap/fss-mqtt
+# Windows
+scoop bucket add fss-mqtt https://github.com/<owner>/scoop-bucket && scoop install fss-mqtt
+winget install <Publisher>.FssMqtt
+```
+
+The Linux binaries are static and run on any distribution. Package-manager channels become available
+once they're set up (see [RELEASING.md](RELEASING.md)).
+
+From source (Rust 1.88+):
+
+```sh
+cargo build --release        # → target/release/fss-mqtt (~1.1 MB)
+cargo install --path .       # or install it to ~/.cargo/bin
+```
+
+## Usage
+
+```sh
+fss-mqtt                                   # mqtt://localhost:1883, subscribes to #
+fss-mqtt broker.example.com                # host[:port]
+fss-mqtt mqtts://broker:8883 -u me -P pw   # TLS (system trust store)
+fss-mqtt broker:8883 --cafile ca.pem        # TLS with your own CA
+fss-mqtt -t 'v1/#' -t '$SYS/#'             # several subscriptions
+```
+
+Connects with MQTT v5 (so user properties are visible) and reconnects automatically.
+TCP and TLS only; WebSocket brokers (`ws://`, `wss://`) are not supported.
+`FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD` and `FSS_MQTT_CAFILE` are read from the environment.
+
+| Flag | Default | |
+|---|---|---|
+| `-t, --topic` | `#` | topic filter to subscribe to (repeatable) |
+| `--history` | `10` | messages kept per topic |
+| `--max-payload` | `64KiB` | payload bytes kept per message; larger payloads are truncated |
+| `--inline` | `64` | payloads up to this size are shown inline in the tree; larger ones show only their size |
+| `--preview` | `50` | payload bytes shown in the detail pane |
+| `-q, --qos` | `0` | subscription QoS |
+| `--cafile` | | PEM file of CA certificates to trust (implies TLS) |
+| `--cert`, `--key` | | client certificate and key for mutual TLS |
+| `--insecure` | | skip TLS certificate verification |
+
+## Filtering
+
+Just type — the tree updates on every keystroke and the cursor jumps to the first match.
+
+- **Pattern** (input contains `/`, `+` or `#`): MQTT-style. `v1/#`, `v1/+/temp`, `+/+/status`.
+  The last level is a case-insensitive *prefix*, so `v1/pl` already shows `v1/plant`, and
+  everything below a match is included.
+- **Search** (anything else): case-insensitive substring over the full topic path; matches are
+  underlined.
+
+`backspace` deletes a character, `ctrl+w` deletes back to the previous level, `esc`/`ctrl+u`
+clears. Clearing keeps the tree open at the topic you were on.
+
+## Keys
+
+| Where | Key | |
+|---|---|---|
+| tree | `↑ ↓ pgup pgdn home end` | move |
+| tree | `→` | expand; on a topic with messages, enter its message list |
+| tree | `←` | collapse, or jump to parent |
+| tree | `⏎` | open the latest message full screen |
+| messages | `↑ ↓` | pick one of the last 10 messages (properties and preview follow) |
+| messages | `⏎` | open it full screen |
+| messages | `← esc` | back to the tree |
+| full screen | `↑ ↓ pgup pgdn` | scroll |
+| full screen | `← →` | older / newer message |
+| full screen | `tab` | cycle pretty JSON / raw / hex |
+| full screen | `esc q ⏎` | close |
+| anywhere | `ctrl+c` | quit |
+
+A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
+
+Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`) and default to dark.
+
+## Performance notes
+
+Messages are written straight into an in-memory tree; the UI redraws at ~15 fps rather than per
+message, and only the visible rows are rendered. Large payloads are never rendered in the tree and
+are capped in memory by `--max-payload`. Filtering 100k topics takes a few milliseconds.
+
+The MQTT client (`src/mqtt.rs`) is a small MQTT v5 subscriber on blocking I/O with one thread and
+no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
+
+## Development
+
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux, macOS and Windows, checks the
+minimum Rust version, runs the end-to-end test against mosquitto (plain and TLS), and guards the
+release binary size.
+
+```sh
+cargo test
+# end-to-end: starts mosquitto on 127.0.0.1:18830 (plain) and localhost:18883 (TLS)
+scripts/e2e-brokers.sh /tmp/fss-brokers
+FSS_TEST_CA=/tmp/fss-brokers/ca.pem cargo test --release e2e -- --ignored --nocapture
+# filter benchmark over 100k topics:
+cargo test --release bench_filter -- --ignored --nocapture
+```
