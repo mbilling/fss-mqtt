@@ -34,14 +34,14 @@ sudo apt install ./fss-mqtt_<version>-1_amd64.deb
 # Fedora / RHEL / openSUSE
 sudo dnf install ./fss-mqtt-<version>-1.x86_64.rpm
 # Homebrew (macOS, Linux)
-brew install <owner>/tap/fss-mqtt
+brew install mbilling/tap/fss-mqtt
 # Windows
-scoop bucket add fss-mqtt https://github.com/<owner>/scoop-bucket && scoop install fss-mqtt
-winget install <Publisher>.FssMqtt
+scoop bucket add mbilling https://github.com/mbilling/scoop-bucket
+scoop install fss-mqtt
 ```
 
-The Linux binaries are static and run on any distribution. Package-manager channels become available
-once they're set up (see [RELEASING.md](RELEASING.md)).
+The Linux binaries are static and run on any distribution. winget isn't set up yet
+(see [RELEASING.md](RELEASING.md)).
 
 From source (Rust 1.88+):
 

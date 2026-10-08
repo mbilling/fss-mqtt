@@ -29,28 +29,34 @@ public repositories. For a private repository, remove that matrix entry or use a
 ## One-time setup for package managers
 
 Each channel is off until its repository **variable** is set
-(Settings → Secrets and variables → Actions → Variables). Tokens go under **Secrets**.
-Use fine-grained personal access tokens limited to the one repository they push to,
-with *Contents: read and write*.
+(Settings → Secrets and variables → Actions → Variables); its key or token goes under **Secrets**.
 
-### Homebrew (macOS and Linux)
+### Homebrew (macOS and Linux) and Scoop (Windows)
 
-1. Create a public repo named `homebrew-tap` (e.g. `<owner>/homebrew-tap`), with a README.
-2. Variable `HOMEBREW_TAP` = `<owner>/homebrew-tap`; secret `HOMEBREW_TAP_TOKEN` = token for it.
-3. Users install with:
-   ```sh
-   brew install <owner>/tap/fss-mqtt
-   ```
+Set up for this repository: `mbilling/homebrew-tap` and `mbilling/scoop-bucket`. Each release
+pushes `Formula/fss-mqtt.rb` and `bucket/fss-mqtt.json` there; nothing to maintain by hand.
 
-### Scoop (Windows)
+The workflow pushes with a **deploy key** per repository: an SSH key that can write to that one
+repository only and doesn't expire. To set it up again (e.g. under another owner):
 
-1. Create a public repo, e.g. `<owner>/scoop-bucket`.
-2. Variable `SCOOP_BUCKET` = `<owner>/scoop-bucket`; secret `SCOOP_BUCKET_TOKEN` = token for it.
-3. Users install with:
-   ```powershell
-   scoop bucket add fss-mqtt https://github.com/<owner>/scoop-bucket
-   scoop install fss-mqtt
-   ```
+```sh
+ssh-keygen -t ed25519 -N "" -f tap-key
+gh repo deploy-key add tap-key.pub -R <owner>/homebrew-tap --allow-write --title "fss-mqtt release workflow"
+gh secret set HOMEBREW_TAP_KEY -R <owner>/fss-mqtt < tap-key
+gh variable set HOMEBREW_TAP -R <owner>/fss-mqtt --body "<owner>/homebrew-tap"
+rm tap-key tap-key.pub
+# same for scoop-bucket with SCOOP_BUCKET_KEY / SCOOP_BUCKET
+```
+
+Users install with:
+
+```sh
+brew install mbilling/tap/fss-mqtt
+```
+```powershell
+scoop bucket add mbilling https://github.com/mbilling/scoop-bucket
+scoop install fss-mqtt
+```
 
 ### winget (Windows)
 

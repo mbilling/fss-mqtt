@@ -4,8 +4,8 @@ name: Release
 #
 # Package-manager publishing is opt-in; each job runs only when its repository
 # variable is set (Settings → Secrets and variables → Actions):
-#   Homebrew  vars.HOMEBREW_TAP   = "<owner>/homebrew-tap"   + secrets.HOMEBREW_TAP_TOKEN
-#   Scoop     vars.SCOOP_BUCKET   = "<owner>/scoop-bucket"   + secrets.SCOOP_BUCKET_TOKEN
+#   Homebrew  vars.HOMEBREW_TAP   = "<owner>/homebrew-tap"   + secrets.HOMEBREW_TAP_KEY (deploy key)
+#   Scoop     vars.SCOOP_BUCKET   = "<owner>/scoop-bucket"   + secrets.SCOOP_BUCKET_KEY (deploy key)
 #   winget    vars.WINGET_ID      = "<Publisher>.FssMqtt"    + secrets.WINGET_TOKEN
 # See RELEASING.md.
 
@@ -121,7 +121,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ${{ vars.HOMEBREW_TAP }}
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_KEY }}
           path: tap
       - name: Commit to tap
         run: |
@@ -149,7 +149,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: ${{ vars.SCOOP_BUCKET }}
-          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          ssh-key: ${{ secrets.SCOOP_BUCKET_KEY }}
           path: bucket
       - name: Commit to bucket
         run: |
