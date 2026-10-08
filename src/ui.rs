@@ -695,6 +695,12 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
     put(buf, r.x + 2, r.y + 1, line, inner as u16);
     buf.set_string(r.right() - 1, r.y + 1, "│", bs);
     buf.set_string(r.x, r.y + 2, format!("╰{bar}╯"), bs);
+    // The version sits in the bottom-right of the border.
+    let v = format!(" {} ", version());
+    let vw = v.chars().count() as u16;
+    if r.width > vw + 6 {
+        buf.set_string(r.right() - 2 - vw, r.y + 2, v, th.faint);
+    }
 }
 
 fn hint<'a>(th: &Theme, pairs: &[(&str, &str)]) -> Line<'a> {
@@ -708,6 +714,17 @@ fn hint<'a>(th: &Theme, pairs: &[(&str, &str)]) -> Line<'a> {
         spans.push(Span::styled(v.to_string(), th.dim));
     }
     Line::from(spans)
+}
+
+fn version() -> String {
+    format!("fss-mqtt v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// The hint line with the version in the bottom-right corner; the version is
+/// dropped when the line is too narrow for both.
+fn with_version<'a>(app: &App, hints: Line<'a>) -> Line<'a> {
+    let v = Span::styled(format!("{} ", version()), app.th.faint);
+    join_lr(hints.spans, vec![v], app.width as usize)
 }
 
 fn hints<'a>(app: &App) -> Line<'a> {
@@ -776,7 +793,7 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
             th.faint,
         ));
     }
-    put(buf, 0, area.height - 1, h, area.width);
+    put(buf, 0, area.height - 1, with_version(app, h), area.width);
 }
 
 #[cfg(test)]
@@ -1014,6 +1031,10 @@ mod tests {
         let v = frame(&app, "start");
         assert!(v.contains("Connections 1/2") && v.contains("local") && v.contains("staging"));
         assert!(v.contains("v1") && v.contains("v2") && v.contains("devices"));
+        assert!(
+            v.contains(&format!(" {} ─╯", super::version())),
+            "version in the filter box border"
+        );
 
         typ(&mut app, "v1/+/line1");
         let v = frame(&app, "filter v1/+/line1");
