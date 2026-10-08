@@ -155,6 +155,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 A green `•`/`▸` means the topic (or something under it) received a message in the last 1.5 s.
 
 Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`) and default to dark.
+Terminals without 24-bit colour (Apple Terminal, for one) get the nearest colours from the
+256-colour palette instead; 24-bit colour is used when `COLORTERM=truecolor` is set, in iTerm2,
+WezTerm, VS Code, Ghostty and on Windows. `FSS_MQTT_COLOR=truecolor` or `=256` overrides the guess.
 
 ## Performance notes
 

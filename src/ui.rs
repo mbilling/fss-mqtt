@@ -933,6 +933,15 @@ mod tests {
         };
         let css = |c: Color, def: &str| match c {
             Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Indexed(n @ 16..=231) => {
+                let lv = |i: u8| [0u8, 95, 135, 175, 215, 255][i as usize];
+                let i = n - 16;
+                format!("#{:02x}{:02x}{:02x}", lv(i / 36), lv(i / 6 % 6), lv(i % 6))
+            }
+            Color::Indexed(n @ 232..) => {
+                let v = 8 + 10 * (n - 232);
+                format!("#{v:02x}{v:02x}{v:02x}")
+            }
             _ => def.to_string(),
         };
         let mut out = format!(
@@ -971,10 +980,17 @@ mod tests {
     fn snapshots() {
         let dir = PathBuf::from(std::env::var("FSS_SNAPSHOT_DIR").expect("set FSS_SNAPSHOT_DIR"));
         std::fs::create_dir_all(&dir).unwrap();
-        for light in [false, true] {
+        for (light, ansi256) in [(false, false), (true, false), (false, true)] {
             let (mut app, _rx) = sample(tmp_config("snap"));
             app.th = Theme::new(light);
-            let mode = if light { "light" } else { "dark" };
+            if ansi256 {
+                app.th.use_ansi256();
+            }
+            let mode = match (light, ansi256) {
+                (_, true) => "dark256",
+                (true, _) => "light",
+                _ => "dark",
+            };
             typ(&mut app, "v1/+/line1");
             press(&mut app, &[KeyCode::Down, KeyCode::Down]);
             std::fs::write(dir.join(format!("{mode}-1-tree.html")), html(&app, light)).unwrap();
