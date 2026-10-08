@@ -1,0 +1,11 @@
+[[connection]]
+name         = "oslo"
+url          = "mqtt://fss-demo-oslo:1883"
+topics       = ["site/#", "$SYS/broker/load/#"]
+autoconnect  = true
+
+[[connection]]
+name         = "bergen"
+url          = "mqtt://fss-demo-bergen:1883"
+topics       = ["site/#"]
+autoconnect  = true

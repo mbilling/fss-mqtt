@@ -3,26 +3,7 @@
 A fast, keyboard-driven MQTT explorer for the terminal. Subscribe to a broker and get a
 live topic tree you narrow down just by typing.
 
-```
- ✻ fss-mqtt  mqtt://localhost:1883  ● connected                      9 topics  21 msgs  412/s
-╭─ Topics ──────────────────────────────╮╭─ v1/plant/line1/temp ─────────────────────────╮
-│   ▾ v1                             19 ││ 3 msgs · last now · qos 1                     │
-│     ▾ plant                        18 ││                                               │
-│       ▾ line1                       6 ││ Messages                                      │
-│         • status = RUNNING          3 ││ › 17:59:19.363   49 B  {"t":22.5,"ok":true,…  │
-│ ❯       • temp = {"t":22.5,"ok":…   3 ││   17:59:18.912   49 B  {"t":21.5,"ok":true,…  │
-│     ▸ camera (1)                    1 ││                                               │
-│                                       ││ Properties                                    │
-│                                       ││   content-type  application/json              │
-│                                       ││   site          oslo                          │
-│                                       ││ Payload · 49 B                                │
-│                                       ││   {"t":22.5,"ok":true,"tags":["a","b"],"no…   │
-╰───────────────────────────────────────╯╰───────────────────────────────────────────────╯
-╭───────────────────────────────────────────────────────────────────────────────────────╮
-│ > v1/+/line1                                                       pattern · 4 topics │
-╰───────────────────────────────────────────────────────────────────────────────────────╯
-  ↑↓ move  ·  ←→ collapse/expand  ·  ⏎ open  ·  esc clear filter  ·  ^w up a level  ·  ^c quit
-```
+![fss-mqtt: browsing two brokers, filtering, opening messages, pausing a subscription](docs/demo.gif)
 
 ## Install
 
@@ -184,3 +165,8 @@ FSS_TEST_CA=/tmp/fss-brokers/ca.pem cargo test --release e2e -- --ignored --noca
 # filter benchmark over 100k topics:
 cargo test --release bench_filter -- --ignored --nocapture
 ```
+
+The demo GIF is recorded with [VHS](https://github.com/charmbracelet/vhs) against two throwaway
+brokers fed with simulated wind-farm data, all in Docker: build a static Linux binary for your
+Docker architecture (e.g. `cargo build --release --target aarch64-unknown-linux-musl`), then run
+`docs/demo/record.sh <that binary>`. The script is `docs/demo/demo.tape`.
