@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{App, Focus, PanelRow, msg_index, node_title};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
+use crate::glyph;
 use crate::store::{ConnInfo, ConnState, FilterMode, MATCHED, Message, Row, Store};
 use crate::theme::Theme;
 
@@ -51,8 +52,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
     match (c.status.state, c.status.err.is_some()) {
         (ConnState::Connected, _) => Span::styled("●", th.green),
-        (ConnState::Connecting, false) => Span::styled("◌", th.yellow),
-        (ConnState::Connecting, true) => Span::styled("◌", th.red),
+        (ConnState::Connecting, false) => Span::styled(glyph::CONNECTING, th.yellow),
+        (ConnState::Connecting, true) => Span::styled(glyph::CONNECTING, th.red),
         (ConnState::Disconnected, _) => Span::styled("○", th.dim),
     }
 }
@@ -96,7 +97,7 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
             sel_line = Some(lines.len());
         }
         let mark = match (sel, focused) {
-            (true, true) => Span::styled("❯ ", th.accent_b),
+            (true, true) => Span::styled(glyph::CURSOR, th.accent_b),
             (true, false) => Span::styled("› ", th.dim),
             _ => Span::raw("  "),
         };
@@ -129,9 +130,9 @@ fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
                     mark,
                     Span::raw("    "),
                     if s.enabled {
-                        Span::styled("☑ ", th.green)
+                        Span::styled(glyph::ON, th.green)
                     } else {
-                        Span::styled("☐ ", th.dim)
+                        Span::styled(glyph::OFF, th.dim)
                     },
                     Span::styled(s.topic.clone(), if s.enabled { th.text } else { th.dim }),
                 ];
@@ -173,7 +174,10 @@ fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
             Span::styled(" ", th.cursor),
         ]),
         Line::default(),
-        Line::styled("⏎ connect  ·  esc cancel  ·  kept in memory only", th.faint),
+        Line::styled(
+            format!("{} connect  ·  esc cancel  ·  kept in memory only", glyph::ENTER),
+            th.faint,
+        ),
     ];
     draw_box(buf, r, &format!("Connect {}", c.name), lines, true, None, th);
 }
@@ -240,7 +244,7 @@ fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let failing = st.conns.iter().filter(|c| c.status.err.is_some()).count();
     let mut left = vec![
         Span::raw(" "),
-        Span::styled("✻ fss-mqtt", th.accent_b),
+        Span::styled(format!("{} fss-mqtt", glyph::LOGO), th.accent_b),
         Span::raw("  "),
         Span::styled(
             format!("{up}/{} connected", st.conns.len()),
@@ -323,7 +327,7 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
     let th = &app.th;
     let n = &st.nodes[r.node];
     let mut spans = vec![match (sel, app.focus) {
-        (true, Focus::Tree) => Span::styled("❯ ", th.accent_b),
+        (true, Focus::Tree) => Span::styled(glyph::CURSOR, th.accent_b),
         (true, _) => Span::styled("› ", th.dim),
         _ => Span::raw("  "),
     }];
@@ -380,7 +384,7 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
     let th = &app.th;
     let base = if sel { th.bold } else { th.text };
     if name.is_empty() {
-        return vec![Span::styled("∅", th.dim.add_modifier(Modifier::ITALIC))];
+        return vec![Span::styled(glyph::EMPTY, th.dim.add_modifier(Modifier::ITALIC))];
     }
     if mark & MATCHED == 0 {
         return vec![Span::styled(name.to_string(), base)];
@@ -473,7 +477,7 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> (Vec<Line<'a>>
     let sel_line = out.len() + idx;
     for (i, m) in msgs.iter().enumerate() {
         let (mark, ts) = match (i == idx, app.focus) {
-            (true, Focus::Msgs) => (Span::styled("❯ ", th.accent_b), th.text),
+            (true, Focus::Msgs) => (Span::styled(glyph::CURSOR, th.accent_b), th.text),
             (true, _) => (Span::styled("› ", th.faint), th.dim),
             _ => (Span::raw("  "), th.dim),
         };
@@ -537,7 +541,10 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> (Vec<Line<'a>>
         }
     }
     out.push(Line::default());
-    out.push(Line::styled("  ⏎ to view the full message", th.faint));
+    out.push(Line::styled(
+        format!("  {} to view the full message", glyph::ENTER),
+        th.faint,
+    ));
     (out, Some(sel_line))
 }
 
@@ -592,9 +599,9 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
         let mut spans = vec![
             Span::raw("  "),
             if s.enabled {
-                Span::styled("☑ ", th.green)
+                Span::styled(glyph::ON, th.green)
             } else {
-                Span::styled("☐ ", th.dim)
+                Span::styled(glyph::OFF, th.dim)
             },
             Span::styled(s.topic.clone(), th.text),
         ];
@@ -681,11 +688,7 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         left.push(Span::styled(" ", th.cursor));
     }
     let line = join_lr(left, info, inner);
-    let bs = if app.filter_text.is_empty() {
-        th.border
-    } else {
-        th.focus_border
-    };
+    let bs = th.border;
     let bar = "─".repeat(r.width.saturating_sub(2) as usize);
     buf.set_string(r.x, r.y, format!("╭{bar}╮"), bs);
     buf.set_string(r.x, r.y + 1, "│", bs);
@@ -716,7 +719,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &app.th,
             &[
                 ("↑↓", "move"),
-                ("space ⏎", "connect / subscribe on-off"),
+                (&format!("space {}", glyph::ENTER), "connect / subscribe on-off"),
                 ("tab", "next pane"),
                 ("type", "filter"),
                 ("^c", "quit"),
@@ -727,7 +730,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &app.th,
             &[
                 ("↑↓", "messages"),
-                ("⏎", "open"),
+                (glyph::ENTER, "open"),
                 ("← esc", "back to tree"),
                 ("tab", "next pane"),
                 ("^c", "quit"),
@@ -739,7 +742,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             &[
                 ("↑↓", "move"),
                 ("←→", "collapse/expand"),
-                ("⏎", "open"),
+                (glyph::ENTER, "open"),
                 ("esc", "clear filter"),
                 ("tab", "next pane"),
                 ("^c", "quit"),
@@ -788,6 +791,7 @@ mod tests {
 
     use crate::app::{App, ConnCtl, Focus, Options};
     use crate::config::{self, ConnCfg};
+    use crate::glyph;
     use crate::mqtt::Cmd;
     use crate::store::{ConnState, Props, Store, Sub};
     use crate::theme::Theme;
@@ -1063,7 +1067,7 @@ mod tests {
         let saved = config::load(&cfg).unwrap();
         assert_eq!(saved[0].paused, vec!["v1/#"]);
         let v = frame(&app, "v1 paused");
-        assert!(v.contains("☐ v1/#"));
+        assert!(v.contains(&format!("{}v1/#", glyph::OFF)));
         // And back on.
         press(&mut app, &[KeyCode::Enter]);
         assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v1/#"));

@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod fmt;
+mod glyph;
 mod mqtt;
 mod store;
 mod theme;

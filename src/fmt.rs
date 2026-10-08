@@ -130,7 +130,7 @@ pub fn one_line(b: &[u8], max: usize) -> String {
     };
     s.chars()
         .filter_map(|c| match c {
-            '\n' => Some('↵'),
+            '\n' => Some(crate::glyph::NEWLINE),
             '\r' => None,
             '\t' => Some(' '),
             '\u{FFFD}' => Some('·'),
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn misc() {
         assert_eq!(commas(1234567), "1,234,567");
-        assert_eq!(one_line(b"a\nb\x01", 10), "a↵b·");
+        assert_eq!(one_line(b"a\nb\x01", 10), format!("a{}b·", crate::glyph::NEWLINE));
         assert!(is_text(b"hello"));
         assert!(!is_text(&[0, 1, 2, 0xff]));
         assert_eq!(trunc_left("v1/plant/temp", 6), "…/temp");
