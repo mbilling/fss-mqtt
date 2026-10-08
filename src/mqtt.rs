@@ -372,6 +372,10 @@ impl Reader {
         if self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
+            // A large packet grew the buffer; give that memory back.
+            if self.buf.capacity() > 1 << 20 {
+                self.buf = Vec::new();
+            }
         }
         Some(pkt)
     }
@@ -614,6 +618,15 @@ mod tests {
         assert_eq!((topic.as_str(), pid, payload), ("a/b", 7, &b"hi"[..]));
         assert_eq!(p.content_type.as_deref(), Some("t"));
         assert_eq!(p.user, vec![("k".to_string(), "v".to_string())]);
+    }
+
+    #[test]
+    fn reader_releases_large_buffer() {
+        let data = packet(0x30, vec![0u8; 3 << 20]);
+        let mut rd = Reader::default();
+        let mut src = &data[..];
+        assert_eq!(rd.next(&mut src).unwrap().unwrap().1.len(), 3 << 20);
+        assert!(rd.buf.capacity() <= 1 << 20, "buffer kept {} bytes", rd.buf.capacity());
     }
 
     #[test]

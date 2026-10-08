@@ -506,6 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn large_payload_keeps_only_prefix() {
+        let mut s = Store::new(10, 4 * 1024);
+        let big = vec![b'x'; 5 * 1024 * 1024];
+        s.add("cam/frame", &big, 0, false, Props::default());
+        let n = &s.nodes[s.nodes[s.nodes[ROOT].children["cam"]].children["frame"]];
+        let m = n.latest().unwrap();
+        assert_eq!(m.payload.len(), 4096);
+        assert!(
+            m.payload.capacity() <= 4096,
+            "allocation must not keep the full payload"
+        );
+        assert_eq!(m.size, big.len());
+        assert!(m.truncated());
+    }
+
+    #[test]
     fn natural() {
         let mut v = vec!["s10", "s2", "s1", "a", "s02x"];
         v.sort_by(|a, b| natural_cmp(a, b));

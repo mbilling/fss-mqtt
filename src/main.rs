@@ -34,7 +34,7 @@ Flags:
       --inline int           payloads up to this many bytes are shown inline in the tree (default 64)
       --insecure             skip TLS certificate verification
       --key string           client private key PEM for mutual TLS
-      --max-payload string   bytes of each payload kept in memory; larger payloads are truncated (default \"64KiB\")
+      --max-payload string   payload bytes kept per message; the rest is discarded on arrival (default \"4KiB\")
   -P, --password string      password
       --preview int          payload bytes shown in the detail pane (default 50)
   -q, --qos int              subscription QoS (0, 1, 2)
@@ -78,7 +78,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         client_id: None,
         qos: 0,
         history: 10,
-        max_payload: 64 * 1024,
+        max_payload: 4 * 1024,
         preview: 50,
         inline: 64,
         insecure: false,

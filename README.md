@@ -68,7 +68,7 @@ TCP and TLS only; WebSocket brokers (`ws://`, `wss://`) are not supported.
 |---|---|---|
 | `-t, --topic` | `#` | topic filter to subscribe to (repeatable) |
 | `--history` | `10` | messages kept per topic |
-| `--max-payload` | `64KiB` | payload bytes kept per message; larger payloads are truncated |
+| `--max-payload` | `4KiB` | payload bytes kept per message; the rest is discarded on arrival |
 | `--inline` | `64` | payloads up to this size are shown inline in the tree; larger ones show only their size |
 | `--preview` | `50` | payload bytes shown in the detail pane |
 | `-q, --qos` | `0` | subscription QoS |
@@ -113,8 +113,10 @@ Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`)
 ## Performance notes
 
 Messages are written straight into an in-memory tree; the UI redraws at ~15 fps rather than per
-message, and only the visible rows are rendered. Large payloads are never rendered in the tree and
-are capped in memory by `--max-payload`. Filtering 100k topics takes a few milliseconds.
+message, and only the visible rows are rendered. Large payloads are never rendered in the tree. Each
+topic keeps its last `--history` messages (10), and each message keeps only the first `--max-payload`
+bytes (4 KiB); the rest is discarded as it arrives, so a topic costs at most about 40 KiB of payload
+however large or frequent its messages are. Filtering 100k topics takes a few milliseconds.
 
 The MQTT client (`src/mqtt.rs`) is a small MQTT v5 subscriber on blocking I/O with one thread and
 no async runtime, which keeps the binary around 1 MB. TLS uses rustls.
