@@ -53,19 +53,62 @@ cargo install --path .       # or install it to ~/.cargo/bin
 ## Usage
 
 ```sh
-fss-mqtt                                   # mqtt://localhost:1883, subscribes to #
-fss-mqtt broker.example.com                # host[:port]
-fss-mqtt mqtts://broker:8883 -u me -P pw   # TLS (system trust store)
-fss-mqtt broker:8883 --cafile ca.pem        # TLS with your own CA
-fss-mqtt -t 'v1/#' -t '$SYS/#'             # several subscriptions
+fss-mqtt broker.example.com                # connect (and save the connection)
+fss-mqtt mqtts://broker:8883 -u me         # TLS (system trust store); asks for the password
+fss-mqtt broker:8883 --cafile ca.pem       # TLS with your own CA
+fss-mqtt broker -t 'v1/#' -t '$SYS/#'      # several subscriptions
+fss-mqtt                                   # connect the saved connections marked autoconnect
+fss-mqtt -c local -c staging               # connect these saved connections
 ```
 
 Connects with MQTT v5 (so user properties are visible) and reconnects automatically.
 TCP and TLS only; WebSocket brokers (`ws://`, `wss://`) are not supported.
 `FSS_MQTT_BROKER`, `FSS_MQTT_USERNAME`, `FSS_MQTT_PASSWORD` and `FSS_MQTT_CAFILE` are read from the environment.
+With no saved connections and no broker given, it connects to `mqtt://localhost:1883` (not saved).
+
+## Connections
+
+Several brokers can be connected at once. Each is a top-level branch in the topic tree and keeps its
+own topics and history while you connect, disconnect or pause its subscriptions. Filters match
+below the broker level, so `devices/#` shows matches from every broker.
+
+Connections are kept in a small file you can edit:
+`~/.config/fss-mqtt/connections.toml` (Linux, macOS; `$XDG_CONFIG_HOME` is honoured) or
+`%APPDATA%\fss-mqtt\connections.toml` (Windows); `--config` picks another file.
+
+```toml
+[[connection]]
+name         = "local"
+url          = "mqtts://127.0.0.1:8883"
+cafile       = "~/secrets/ca.pem"          # also: cert, key, insecure = true
+username     = "backend"
+password_env = "BROKER_PW"                 # read from this environment variable
+client_id    = "fss-mqtt-ci"               # optional; random by default
+qos          = 1                           # optional; 0 by default
+topics       = ["devices/+/up/#", "$SYS/#"]
+paused       = ["$SYS/#"]                  # listed, but not subscribed
+autoconnect  = true                        # connect when started without -c or a broker
+```
+
+- **Adding:** connect from the command line (the entry is added or updated, named `user@host:port`
+  or `--name`; `--no-save` skips this), or add a block to the file. `--cafile`, `--cert` and
+  `--key` are saved as absolute paths, so the entry works from any directory; in the file you can
+  also write `~/…`.
+- **Passwords are never written.** Set `password_env`, or fss-mqtt asks when it connects and keeps
+  the password in memory only. `FSS_MQTT_PASSWORD` is saved as `password_env`; `-P` is not.
+- **Saving** rewrites only that connection's block, so your comments elsewhere in the file stay.
+  Pausing or resuming a subscription in the panel is saved the same way.
+
+The panel at the top lists each connection with its subscriptions. `tab` moves between the panel,
+the topic tree and the message list; in the panel, `space` or `⏎` connects or disconnects a
+connection, or turns a subscription on or off (subscribed and unsubscribed live).
 
 | Flag | Default | |
 |---|---|---|
+| `-c, --connection` | | saved connection to connect (repeatable) |
+| `--name` | `user@host:port` | name to save the broker under |
+| `--no-save` | | don't add the broker to the connections file |
+| `--config` | see above | connections file |
 | `-t, --topic` | `#` | topic filter to subscribe to (repeatable) |
 | `--history` | `10` | messages kept per topic |
 | `--max-payload` | `4KiB` | payload bytes kept per message; the rest is discarded on arrival |
@@ -93,6 +136,9 @@ clears. Clearing keeps the tree open at the topic you were on.
 
 | Where | Key | |
 |---|---|---|
+| anywhere | `tab` / `shift+tab` | next / previous pane: connections, topics, messages |
+| connections | `↑ ↓` | move |
+| connections | `space` `⏎` | connect / disconnect, or subscription on / off |
 | tree | `↑ ↓ pgup pgdn home end` | move |
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |

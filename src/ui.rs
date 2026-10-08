@@ -8,9 +8,9 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
-use crate::app::{App, Focus, msg_index};
+use crate::app::{App, Focus, PanelRow, msg_index, node_title};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
-use crate::store::{ConnState, FilterMode, MATCHED, Message, Row, Store};
+use crate::store::{ConnInfo, ConnState, FilterMode, MATCHED, Message, Row, Store};
 use crate::theme::Theme;
 
 const ACTIVE_FOR: Duration = Duration::from_millis(1500);
@@ -30,17 +30,152 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let l = app.layout();
     put(buf, 0, 0, header(app, &st), area.width);
-    let tree_area = Rect::new(0, 1, l.tree_w, l.tree_h);
+    panel_box(buf, Rect::new(0, 1, area.width, l.panel_h), app, &st);
+    let top = 1 + l.panel_h;
+    let tree_area = Rect::new(0, top, l.tree_w, l.tree_h);
     let det_area = if l.stacked {
-        Rect::new(0, 1 + l.tree_h, l.det_w, l.det_h)
+        Rect::new(0, top + l.tree_h, l.det_w, l.det_h)
     } else {
-        Rect::new(l.tree_w, 1, l.det_w, l.det_h)
+        Rect::new(l.tree_w, top, l.det_w, l.det_h)
     };
     tree_box(buf, tree_area, app, &st);
     detail_box(buf, det_area, app, &st);
     let y = det_area.bottom();
     input_box(buf, Rect::new(0, y, area.width, 3), app);
     put(buf, 0, y + 3, hints(app), area.width);
+    if app.prompt.is_some() {
+        prompt_box(buf, area, app, &st);
+    }
+}
+
+fn status_dot<'a>(th: &Theme, c: &ConnInfo) -> Span<'a> {
+    match (c.status.state, c.status.err.is_some()) {
+        (ConnState::Connected, _) => Span::styled("●", th.green),
+        (ConnState::Connecting, false) => Span::styled("◌", th.yellow),
+        (ConnState::Connecting, true) => Span::styled("◌", th.red),
+        (ConnState::Disconnected, _) => Span::styled("○", th.dim),
+    }
+}
+
+fn status_text(c: &ConnInfo) -> String {
+    match (&c.status.state, &c.status.err) {
+        (ConnState::Connected, _) => "connected".into(),
+        (ConnState::Connecting, None) => "connecting…".into(),
+        (ConnState::Connecting, Some(e)) => format!("retrying · {e}"),
+        (ConnState::Disconnected, _) => "disconnected".into(),
+    }
+}
+
+fn panel_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
+    let th = &app.th;
+    let (ih, iw) = (r.height.saturating_sub(2) as usize, r.width.saturating_sub(4) as usize);
+    let focused = app.focus == Focus::Conns;
+    let mut lines = Vec::new();
+    if app.panel.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "No connections. Run fss-mqtt <broker> or add one to {}",
+                app.config_path.display()
+            ),
+            th.dim,
+        ));
+    }
+    // Keep the cursor in view.
+    let offset = app.panel_cursor.saturating_sub(ih.saturating_sub(1));
+    let name_w = st
+        .conns
+        .iter()
+        .map(|c| fmt::str_width(&c.name))
+        .max()
+        .unwrap_or(0)
+        .min(24);
+    let mut sel_line = None;
+    for (i, row) in app.panel.iter().enumerate().skip(offset).take(ih) {
+        let sel = i == app.panel_cursor;
+        if sel {
+            sel_line = Some(lines.len());
+        }
+        let mark = match (sel, focused) {
+            (true, true) => Span::styled("❯ ", th.accent_b),
+            (true, false) => Span::styled("› ", th.dim),
+            _ => Span::raw("  "),
+        };
+        let line = match *row {
+            PanelRow::Conn(c) => {
+                let ci = &st.conns[c];
+                let node = &st.nodes[ci.node];
+                let mut left = vec![
+                    mark,
+                    status_dot(th, ci),
+                    Span::raw(" "),
+                    Span::styled(fmt::pad(&ci.name, name_w), if sel { th.bold } else { th.text }),
+                    Span::raw("  "),
+                    Span::styled(ci.url.clone(), th.dim),
+                ];
+                if let Some(u) = &ci.username {
+                    left.push(Span::styled(format!("  {u}"), th.dim));
+                }
+                let state_style = match (ci.status.state, ci.status.err.is_some()) {
+                    (_, true) => th.red,
+                    (ConnState::Connected, _) => th.green,
+                    _ => th.dim,
+                };
+                left.push(Span::styled(format!("  {}", status_text(ci)), state_style));
+                join_lr(left, vec![Span::styled(msg_count(node.sub_msgs), th.faint)], iw)
+            }
+            PanelRow::Sub(c, j) => {
+                let s = &st.conns[c].subs[j];
+                let mut spans = vec![
+                    mark,
+                    Span::raw("    "),
+                    if s.enabled {
+                        Span::styled("☑ ", th.green)
+                    } else {
+                        Span::styled("☐ ", th.dim)
+                    },
+                    Span::styled(s.topic.clone(), if s.enabled { th.text } else { th.dim }),
+                ];
+                if let Some(e) = &s.err {
+                    spans.push(Span::styled(format!("  refused: {e}"), th.red));
+                }
+                Line::from(spans)
+            }
+        };
+        lines.push(line);
+    }
+    let up = st
+        .conns
+        .iter()
+        .filter(|c| c.status.state == ConnState::Connected)
+        .count();
+    let title = format!("Connections {up}/{}", st.conns.len());
+    draw_box(buf, r, &title, lines, focused, sel_line, th);
+}
+
+fn prompt_box(buf: &mut Buffer, area: Rect, app: &App, st: &Store) {
+    let th = &app.th;
+    let p = app.prompt.as_ref().unwrap();
+    let c = &st.conns[p.conn];
+    let w = area.width.clamp(20, 64);
+    let r = Rect::new((area.width - w) / 2, area.height / 3, w, 7);
+    for y in r.y..r.bottom().min(area.height) {
+        for x in r.x..r.right() {
+            buf[(x, y)].reset();
+        }
+    }
+    let who = format!("{}@{}", c.username.as_deref().unwrap_or(""), c.url);
+    let lines = vec![
+        Line::styled(who, th.dim),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("Password ", th.text),
+            Span::styled("•".repeat(p.input.chars().count()), th.text),
+            Span::styled(" ", th.cursor),
+        ]),
+        Line::default(),
+        Line::styled("⏎ connect  ·  esc cancel  ·  kept in memory only", th.faint),
+    ];
+    draw_box(buf, r, &format!("Connect {}", c.name), lines, true, None, th);
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, line: Line, w: u16) {
@@ -51,12 +186,13 @@ fn put(buf: &mut Buffer, x: u16, y: u16, line: Line, w: u16) {
 }
 
 /// Rounded box with a title in the top edge.
-fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: bool, th: &Theme) {
+/// `sel` is the index of the selected line, drawn as a full-width bar.
+fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: bool, sel: Option<usize>, th: &Theme) {
     if r.width < 4 || r.height < 2 {
         return;
     }
     let (bs, ts) = if focused {
-        (th.dim, th.accent_b)
+        (th.focus_border, th.accent_b)
     } else {
         (th.border, th.dim)
     };
@@ -86,29 +222,34 @@ fn draw_box(buf: &mut Buffer, r: Rect, title: &str, lines: Vec<Line>, focused: b
         format!("╰{}╯", "─".repeat(r.width as usize - 2)),
         bs,
     );
+    if let Some(i) = sel
+        && (i as u16) < r.height - 2
+    {
+        let bar = Rect::new(r.x + 1, r.y + 1 + i as u16, r.width - 2, 1);
+        buf.set_style(bar, if focused { th.sel } else { th.sel_dim });
+    }
 }
 
 fn header<'a>(app: &App, st: &Store) -> Line<'a> {
     let th = &app.th;
-    let (dot, state) = match st.status.state {
-        ConnState::Connected => (Span::styled("●", th.green), "connected"),
-        ConnState::Disconnected => (Span::styled("●", th.red), "disconnected"),
-        ConnState::Connecting => (Span::styled("◌", th.yellow), "connecting"),
-    };
-    let mut state = state.to_string();
-    if let Some(e) = &st.status.err {
-        state += &format!(" · {e}");
-    }
-    let left = vec![
+    let up = st
+        .conns
+        .iter()
+        .filter(|c| c.status.state == ConnState::Connected)
+        .count();
+    let failing = st.conns.iter().filter(|c| c.status.err.is_some()).count();
+    let mut left = vec![
         Span::raw(" "),
         Span::styled("✻ fss-mqtt", th.accent_b),
         Span::raw("  "),
-        Span::styled(app.opts.broker.clone(), th.dim),
-        Span::raw("  "),
-        dot,
-        Span::raw(" "),
-        Span::styled(state, th.dim),
+        Span::styled(
+            format!("{up}/{} connected", st.conns.len()),
+            if up > 0 { th.green } else { th.dim },
+        ),
     ];
+    if failing > 0 {
+        left.push(Span::styled(format!("  {failing} failing"), th.red));
+    }
     let right = vec![
         Span::styled(commas(st.topic_count() as u64), th.text),
         Span::styled(" topics  ", th.dim),
@@ -136,25 +277,26 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let th = &app.th;
     let (ih, iw) = (r.height.saturating_sub(2) as usize, r.width.saturating_sub(4) as usize);
     let mut lines = Vec::new();
-    if app.rows.is_empty() {
-        lines.push(Line::default());
-        let refused = st.status.err.as_deref().filter(|e| e.starts_with("subscribe"));
-        if st.topic_count() == 0 {
-            if let Some(e) = refused {
-                lines.push(Line::styled(e.to_string(), th.red));
-                lines.push(Line::default());
+    if app.rows.is_empty() || (st.topic_count() == 0 && app.filter_text.is_empty()) {
+        if st.topic_count() == 0 && app.filter_text.is_empty() {
+            let up = st.conns.iter().any(|c| c.status.state == ConnState::Connected);
+            let refused = st.conns.iter().flat_map(|c| &c.subs).any(|s| s.err.is_some());
+            lines.push(Line::default());
+            if refused {
                 lines.push(Line::styled(
-                    "The broker refused the subscription. Pick topics this user may read, e.g.",
-                    th.dim,
+                    "The broker refused a subscription (see Connections). Pick topics this user may read.",
+                    th.red,
                 ));
-                lines.push(Line::styled("  fss-mqtt … -t 'devices/+/up/#'", th.text));
+            } else if up {
+                lines.push(Line::styled("Waiting for messages …", th.dim));
             } else {
                 lines.push(Line::styled(
-                    format!("Waiting for messages on {} …", app.opts.topics.join(", ")),
+                    "Not connected. tab to Connections, then space to connect.",
                     th.dim,
                 ));
             }
         } else {
+            lines.push(Line::default());
             lines.push(Line::from(vec![
                 Span::styled("Nothing matches ", th.dim),
                 Span::styled(app.filter_text.clone(), th.accent),
@@ -162,7 +304,11 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
         }
     }
     let end = (app.offset + ih).min(app.rows.len());
+    let mut sel_line = None;
     for i in app.offset..end {
+        if i == app.cursor {
+            sel_line = Some(lines.len());
+        }
         lines.push(tree_line(app, st, &app.rows[i], i == app.cursor, iw));
     }
     let title = if app.rows.len() > ih {
@@ -170,7 +316,7 @@ fn tree_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     } else {
         "Topics".into()
     };
-    draw_box(buf, r, &title, lines, app.focus == Focus::Tree, th);
+    draw_box(buf, r, &title, lines, app.focus == Focus::Tree, sel_line, th);
 }
 
 fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a> {
@@ -182,6 +328,18 @@ fn tree_line<'a>(app: &App, st: &Store, r: &Row, sel: bool, w: usize) -> Line<'a
         _ => Span::raw("  "),
     }];
     spans.push(Span::raw("  ".repeat(n.depth - 1)));
+
+    if n.is_conn() {
+        let c = &st.conns[n.conn];
+        spans.push(Span::styled(if r.expanded { "▾ " } else { "▸ " }, th.faint));
+        spans.push(status_dot(th, c));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(n.name.clone(), th.bold));
+        if !r.expanded {
+            spans.push(Span::styled(format!(" ({})", n.topics), th.faint));
+        }
+        return join_lr(spans, vec![Span::styled(human_count(n.sub_msgs), th.faint)], w);
+    }
 
     let active = app
         .now
@@ -254,21 +412,25 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
 
 fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let Some(n) = app.selected else {
-        draw_box(buf, r, "", vec![], false, &app.th);
+        draw_box(buf, r, "", vec![], false, None, &app.th);
         return;
     };
     let node = &st.nodes[n];
     let (iw, ih) = (r.width.saturating_sub(4) as usize, r.height.saturating_sub(2) as usize);
-    let mut lines = if node.has_messages() {
+    let (mut lines, sel) = if node.is_conn() {
+        (conn_detail(app, st, n, iw), None)
+    } else if node.has_messages() {
         topic_detail(app, st, n, iw)
     } else {
-        branch_detail(app, st, n, iw)
+        (branch_detail(app, st, n, iw), None)
     };
     lines.truncate(ih);
-    draw_box(buf, r, &node.path, lines, app.focus == Focus::Msgs, &app.th);
+    let focused = app.focus == Focus::Msgs;
+    draw_box(buf, r, &node_title(st, n), lines, focused, sel, &app.th);
 }
 
-fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
+/// The topic's details, and which line is the selected message.
+fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> (Vec<Line<'a>>, Option<usize>) {
     let th = &app.th;
     let node = &st.nodes[n];
     let msgs = node.messages();
@@ -308,6 +470,7 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> 
         hdr.push(Span::styled(format!("  {}/{}", idx + 1, msgs.len()), th.dim));
     }
     out.push(Line::from(hdr));
+    let sel_line = out.len() + idx;
     for (i, m) in msgs.iter().enumerate() {
         let (mark, ts) = match (i == idx, app.focus) {
             (true, Focus::Msgs) => (Span::styled("❯ ", th.accent_b), th.text),
@@ -375,7 +538,7 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> 
     }
     out.push(Line::default());
     out.push(Line::styled("  ⏎ to view the full message", th.faint));
-    out
+    (out, Some(sel_line))
 }
 
 /// The MQTT v5 properties worth showing, user properties last.
@@ -406,6 +569,42 @@ pub fn message_props(m: &Message) -> Vec<(String, String)> {
         out.push(("subscription-id".into(), v.to_string()));
     }
     out.extend(p.user.iter().cloned());
+    out
+}
+
+fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
+    let th = &app.th;
+    let c = &st.conns[st.nodes[n].conn];
+    let mut out = vec![
+        Line::from(vec![
+            status_dot(th, c),
+            Span::raw(" "),
+            Span::styled(status_text(c), if c.status.err.is_some() { th.red } else { th.text }),
+        ]),
+        Line::styled(c.url.clone(), th.dim),
+    ];
+    if let Some(u) = &c.username {
+        out.push(Line::styled(format!("user {u}"), th.dim));
+    }
+    out.push(Line::default());
+    out.push(Line::styled("Subscriptions", th.section));
+    for s in &c.subs {
+        let mut spans = vec![
+            Span::raw("  "),
+            if s.enabled {
+                Span::styled("☑ ", th.green)
+            } else {
+                Span::styled("☐ ", th.dim)
+            },
+            Span::styled(s.topic.clone(), th.text),
+        ];
+        if let Some(e) = &s.err {
+            spans.push(Span::styled(format!("  refused: {e}"), th.red));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::default());
+    out.extend(branch_detail(app, st, n, w));
     out
 }
 
@@ -482,7 +681,11 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         left.push(Span::styled(" ", th.cursor));
     }
     let line = join_lr(left, info, inner);
-    let bs = th.border;
+    let bs = if app.filter_text.is_empty() {
+        th.border
+    } else {
+        th.focus_border
+    };
     let bar = "─".repeat(r.width.saturating_sub(2) as usize);
     buf.set_string(r.x, r.y, format!("╭{bar}╮"), bs);
     buf.set_string(r.x, r.y + 1, "│", bs);
@@ -497,7 +700,7 @@ fn hint<'a>(th: &Theme, pairs: &[(&str, &str)]) -> Line<'a> {
         if i > 0 {
             spans.push(Span::styled("  ·  ", th.faint));
         }
-        spans.push(Span::styled(k.to_string(), th.text));
+        spans.push(Span::styled(k.to_string(), th.key));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(v.to_string(), th.dim));
     }
@@ -505,14 +708,28 @@ fn hint<'a>(th: &Theme, pairs: &[(&str, &str)]) -> Line<'a> {
 }
 
 fn hints<'a>(app: &App) -> Line<'a> {
-    if app.focus == Focus::Msgs {
+    if let Some((text, error, _)) = &app.notice {
+        return Line::styled(format!("  {text}"), if *error { app.th.red } else { app.th.yellow });
+    }
+    if app.focus == Focus::Conns {
+        hint(
+            &app.th,
+            &[
+                ("↑↓", "move"),
+                ("space ⏎", "connect / subscribe on-off"),
+                ("tab", "next pane"),
+                ("type", "filter"),
+                ("^c", "quit"),
+            ],
+        )
+    } else if app.focus == Focus::Msgs {
         hint(
             &app.th,
             &[
                 ("↑↓", "messages"),
                 ("⏎", "open"),
                 ("← esc", "back to tree"),
-                ("type", "filter"),
+                ("tab", "next pane"),
                 ("^c", "quit"),
             ],
         )
@@ -524,7 +741,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
                 ("←→", "collapse/expand"),
                 ("⏎", "open"),
                 ("esc", "clear filter"),
-                ("^w", "up a level"),
+                ("tab", "next pane"),
                 ("^c", "quit"),
             ],
         )
@@ -538,14 +755,8 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
     let mut lines = v.head.clone();
     let end = (v.scroll + body_h).min(v.lines.len());
     lines.extend(v.lines[v.scroll.min(end)..end].iter().cloned());
-    draw_box(
-        buf,
-        Rect::new(0, 0, area.width, area.height - 1),
-        &v.path,
-        lines,
-        true,
-        th,
-    );
+    let r = Rect::new(0, 0, area.width, area.height - 1);
+    draw_box(buf, r, &v.path, lines, true, None, th);
 
     let mut h = hint(
         th,
@@ -567,18 +778,40 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::app::{App, Focus, Options};
-    use crate::store::{Props, Store};
+    use crate::app::{App, ConnCtl, Focus, Options};
+    use crate::config::{self, ConnCfg};
+    use crate::mqtt::Cmd;
+    use crate::store::{ConnState, Props, Store, Sub};
     use crate::theme::Theme;
 
-    fn sample() -> App {
+    fn sub(t: &str) -> Sub {
+        Sub {
+            topic: t.into(),
+            enabled: true,
+            err: None,
+        }
+    }
+
+    /// Two connections: "local" (connected, with data) and "staging"
+    /// (disconnected, needs a password). Returns the receivers of their commands.
+    fn sample(config_path: PathBuf) -> (App, Vec<Receiver<Cmd>>) {
         let mut st = Store::new(10, 64 * 1024);
+        let local = st.add_conn("local", "mqtts://127.0.0.1:8883", None, vec![sub("v1/#"), sub("v2/#")]);
+        let staging = st.add_conn(
+            "staging",
+            "mqtt://staging:1883",
+            Some("backend".into()),
+            vec![sub("devices/+/up/#")],
+        );
+        st.conns[local].status.state = ConnState::Connected;
         for i in 0..3 {
             for line in ["line1", "line2", "line10"] {
                 let props = Props {
@@ -587,8 +820,9 @@ mod tests {
                     ..Default::default()
                 };
                 let p = format!(r#"{{"t":{}.5,"ok":true,"tags":["a","b"],"note":null}}"#, 20 + i);
-                st.add(&format!("v1/plant/{line}/temp"), p.as_bytes(), 1, false, props);
+                st.add(local, &format!("v1/plant/{line}/temp"), p.as_bytes(), 1, false, props);
                 st.add(
+                    local,
                     &format!("v1/plant/{line}/status"),
                     b"RUNNING",
                     0,
@@ -597,25 +831,61 @@ mod tests {
                 );
             }
         }
-        st.add("v1/camera/frame", &vec![0u8; 200_000], 0, false, Props::default());
-        st.add("v2/fleet/truck7/gps", b"59.91,10.75", 0, true, Props::default());
         st.add(
+            local,
+            "v1/camera/frame",
+            &vec![0u8; 200_000],
+            0,
+            false,
+            Props::default(),
+        );
+        st.add(local, "v2/fleet/truck7/gps", b"59.91,10.75", 0, true, Props::default());
+        st.add(
+            local,
             "v2/fleet/truck7/bin",
             &[0, 1, 2, 0xff, b'h', b'i'],
             0,
             false,
             Props::default(),
         );
+        st.add(staging, "devices/d9/up/temp", b"19.0", 0, false, Props::default());
+
+        let mut rxs = Vec::new();
+        let mut ctls = Vec::new();
+        for (name, user, topics) in [
+            ("local", None, vec!["v1/#", "v2/#"]),
+            ("staging", Some("backend"), vec!["devices/+/up/#"]),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            rxs.push(rx);
+            ctls.push(ConnCtl {
+                cfg: ConnCfg {
+                    name: name.into(),
+                    url: "mqtt://x:1883".into(),
+                    username: user.map(String::from),
+                    topics: topics.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                },
+                saved: true,
+                tx,
+                password: None,
+            });
+        }
         let opts = Options {
-            broker: "mqtt://localhost:1883".into(),
-            topics: vec!["#".into()],
             preview_bytes: 50,
             inline_bytes: 64,
         };
-        let mut app = App::new(Arc::new(Mutex::new(st)), opts, Theme::new(false));
-        app.resize(110, 30);
+        let mut app = App::new(
+            Arc::new(Mutex::new(st)),
+            opts,
+            Theme::new(false),
+            ctls,
+            config_path,
+            vec![],
+        );
+        app.resize(110, 36);
         app.tick();
-        app
+        (app, rxs)
     }
 
     fn typ(app: &mut App, s: &str) {
@@ -646,11 +916,84 @@ mod tests {
         s
     }
 
+    /// Renders a frame as coloured HTML, to check the theme by eye.
+    fn html(app: &App, light: bool) -> String {
+        use ratatui::style::{Color, Modifier};
+        let mut t = Terminal::new(TestBackend::new(app.width, app.height)).unwrap();
+        t.draw(|f| super::draw(f, app)).unwrap();
+        let buf = t.backend().buffer();
+        let (bg0, fg0) = if light {
+            ("#ffffff", "#1f1f1f")
+        } else {
+            ("#1a1a1a", "#e8e6e3")
+        };
+        let css = |c: Color, def: &str| match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            _ => def.to_string(),
+        };
+        let mut out = format!(
+            "<pre style=\"background:{bg0};color:{fg0};font:14px/1.25 Menlo,monospace;padding:12px;margin:0;display:inline-block\">"
+        );
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                let sym = match c.symbol() {
+                    "<" => "&lt;",
+                    ">" => "&gt;",
+                    "&" => "&amp;",
+                    s => s,
+                };
+                let mut st = format!("color:{};background:{}", css(c.fg, fg0), css(c.bg, "transparent"));
+                if c.modifier.contains(Modifier::BOLD) {
+                    st += ";font-weight:bold";
+                }
+                if c.modifier.contains(Modifier::UNDERLINED) {
+                    st += ";text-decoration:underline";
+                }
+                if c.modifier.contains(Modifier::REVERSED) {
+                    st = format!("color:{bg0};background:{fg0}");
+                }
+                out += &format!("<span style=\"{st}\">{sym}</span>");
+            }
+            out.push('\n');
+        }
+        out + "</pre>"
+    }
+
+    /// Writes a few screens as HTML to $FSS_SNAPSHOT_DIR.
+    /// Run with: FSS_SNAPSHOT_DIR=/tmp/snap cargo test snapshots -- --ignored
+    #[test]
+    #[ignore]
+    fn snapshots() {
+        let dir = PathBuf::from(std::env::var("FSS_SNAPSHOT_DIR").expect("set FSS_SNAPSHOT_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for light in [false, true] {
+            let (mut app, _rx) = sample(tmp_config("snap"));
+            app.th = Theme::new(light);
+            let mode = if light { "light" } else { "dark" };
+            typ(&mut app, "v1/+/line1");
+            press(&mut app, &[KeyCode::Down, KeyCode::Down]);
+            std::fs::write(dir.join(format!("{mode}-1-tree.html")), html(&app, light)).unwrap();
+            press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+            std::fs::write(dir.join(format!("{mode}-2-messages.html")), html(&app, light)).unwrap();
+            press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::BackTab, KeyCode::Down]);
+            assert!(app.focus == crate::app::Focus::Conns);
+            std::fs::write(dir.join(format!("{mode}-3-connections.html")), html(&app, light)).unwrap();
+        }
+    }
+
+    fn tmp_config(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("fss-mqtt-test-{}-{name}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
     #[test]
     fn filter_and_navigate() {
-        let mut app = sample();
+        let (mut app, _rx) = sample(tmp_config("nav"));
         let v = frame(&app, "start");
-        assert!(v.contains("v1") && v.contains("v2"));
+        assert!(v.contains("Connections 1/2") && v.contains("local") && v.contains("staging"));
+        assert!(v.contains("v1") && v.contains("v2") && v.contains("devices"));
 
         typ(&mut app, "v1/+/line1");
         let v = frame(&app, "filter v1/+/line1");
@@ -660,7 +1003,13 @@ mod tests {
         let path = |a: &App| a.store.lock().unwrap().nodes[a.selected.unwrap()].path.clone();
         assert_eq!(path(&app), "v1/plant/line1/temp");
         let v = frame(&app, "on leaf");
-        for want in ["site", "oslo", "content-type", r#"{"t":22.5"#] {
+        for want in [
+            "local · v1/plant/line1/temp",
+            "site",
+            "oslo",
+            "content-type",
+            r#"{"t":22.5"#,
+        ] {
             assert!(v.contains(want), "detail pane missing {want}");
         }
 
@@ -684,10 +1033,64 @@ mod tests {
         frame(&app, "filter cleared, path kept open");
         assert_eq!(path(&app), "v1/plant/line1/temp");
 
+        // A pattern matches under every connection.
+        typ(&mut app, "+/+/up");
+        let v = frame(&app, "pattern across brokers");
+        assert!(v.contains("staging") && v.contains("d9") && !v.contains("plant"));
+        press(&mut app, &[KeyCode::Esc]);
+
         typ(&mut app, "truck");
         press(&mut app, &[KeyCode::Down, KeyCode::Down]);
         frame(&app, "search truck");
         app.resize(60, 30);
         frame(&app, "narrow");
+    }
+
+    #[test]
+    fn connections_panel() {
+        let cfg = tmp_config("panel");
+        let (mut app, rx) = sample(cfg.clone());
+
+        // tab from the tree (a connection row, no messages) goes to the panel.
+        press(&mut app, &[KeyCode::Tab]);
+        assert!(app.focus == Focus::Conns);
+        frame(&app, "panel focused");
+
+        // Pause v1/# on local: unsubscribe, and saved as paused.
+        press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Unsubscribe(t)) if t == "v1/#"));
+        assert!(!app.store.lock().unwrap().conns[0].subs[0].enabled);
+        let saved = config::load(&cfg).unwrap();
+        assert_eq!(saved[0].paused, vec!["v1/#"]);
+        let v = frame(&app, "v1 paused");
+        assert!(v.contains("☐ v1/#"));
+        // And back on.
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Subscribe(t)) if t == "v1/#"));
+        assert!(config::load(&cfg).unwrap()[0].paused.is_empty());
+
+        // local is connected: space on it disconnects.
+        press(&mut app, &[KeyCode::Up, KeyCode::Char(' ')]);
+        assert!(matches!(rx[0].try_recv(), Ok(Cmd::Disconnect)));
+
+        // staging needs a password: space asks for it, enter connects with it.
+        press(&mut app, &[KeyCode::End]);
+        press(&mut app, &[KeyCode::Up, KeyCode::Char(' ')]);
+        assert!(app.prompt.is_some());
+        typ(&mut app, "s3cret");
+        let v = frame(&app, "password prompt");
+        assert!(v.contains("Connect staging") && v.contains("••••••") && !v.contains("s3cret"));
+        press(&mut app, &[KeyCode::Enter]);
+        assert!(app.prompt.is_none());
+        assert!(matches!(rx[1].try_recv(), Ok(Cmd::Connect { password: Some(p) }) if p == "s3cret"));
+        assert!(
+            !std::fs::read_to_string(&cfg).unwrap().contains("s3cret"),
+            "password must not be written"
+        );
+
+        // Typing in the panel goes to the filter.
+        typ(&mut app, "tr");
+        assert!(app.focus == Focus::Tree && app.filter_text == "tr");
+        let _ = std::fs::remove_file(&cfg);
     }
 }

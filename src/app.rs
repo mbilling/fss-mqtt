@@ -1,32 +1,63 @@
 //! UI state and key handling.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::store::{Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store};
+use crate::config::{self, ConnCfg};
+use crate::mqtt::Cmd;
+use crate::store::{ConnState, Filter, FilterMode, INSIDE, MATCHED, Message, ROOT, Row, Store};
 use crate::theme::Theme;
 use crate::viewer::Viewer;
 
 /// Up to this many matching topics, a filter expands everything it matched.
 const AUTO_EXPAND_LIMIT: u32 = 300;
+const NOTICE_FOR: Duration = Duration::from_secs(6);
 
 pub struct Options {
-    pub broker: String,
-    pub topics: Vec<String>,
     pub preview_bytes: usize, // payload bytes shown in the detail pane
     pub inline_bytes: usize,  // payloads up to this size are shown inline in the tree
 }
 
+/// The UI's handle on one connection (same index as `Store::conns`).
+pub struct ConnCtl {
+    pub cfg: ConnCfg,
+    pub saved: bool, // lives in the connections file; subscription toggles are written back
+    pub tx: Sender<Cmd>,
+    pub password: Option<String>, // in memory only
+}
+
+impl ConnCtl {
+    fn needs_password(&self) -> bool {
+        self.cfg.username.is_some() && self.password.is_none()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    Conns,
     Tree,
     Msgs,
 }
 
+/// A row in the connections panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanelRow {
+    Conn(usize),
+    Sub(usize, usize),
+}
+
+pub struct Prompt {
+    pub conn: usize,
+    pub input: String,
+}
+
 pub struct Layout {
+    pub panel_h: u16,
     pub tree_w: u16,
     pub tree_h: u16,
     pub det_w: u16,
@@ -41,6 +72,14 @@ pub struct App {
     pub width: u16,
     pub height: u16,
     pub now: SystemTime,
+
+    pub ctls: Vec<ConnCtl>,
+    pub config_path: PathBuf,
+    pub panel: Vec<PanelRow>,
+    pub panel_cursor: usize,
+    pub prompt: Option<Prompt>,
+    prompt_queue: Vec<usize>,
+    pub notice: Option<(String, bool, Instant)>, // text, is_error, when
 
     pub filter_text: String,
     pub filter: Filter,
@@ -69,14 +108,31 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(store: Arc<Mutex<Store>>, opts: Options, th: Theme) -> App {
-        App {
+    /// `ask` lists connections that should connect now but need a password first.
+    pub fn new(
+        store: Arc<Mutex<Store>>,
+        opts: Options,
+        th: Theme,
+        ctls: Vec<ConnCtl>,
+        config_path: PathBuf,
+        ask: Vec<usize>,
+    ) -> App {
+        // Connections start expanded so their top-level topics show.
+        let expanded: HashSet<usize> = store.lock().unwrap().conns.iter().map(|c| c.node).collect();
+        let mut app = App {
             store,
             opts,
             th,
             width: 0,
             height: 0,
             now: SystemTime::now(),
+            ctls,
+            config_path,
+            panel: Vec::new(),
+            panel_cursor: 0,
+            prompt: None,
+            prompt_queue: ask,
+            notice: None,
             filter_text: String::new(),
             filter: Filter::compile(""),
             marks: None,
@@ -85,7 +141,7 @@ impl App {
             cursor: 0,
             offset: 0,
             selected: None,
-            expanded: HashSet::new(),
+            expanded,
             fexp: HashMap::new(),
             struct_ver: u64::MAX,
             need_rebuild: true,
@@ -96,14 +152,25 @@ impl App {
             rate_total: 0,
             rate_at: Instant::now(),
             quit: false,
-        }
+        };
+        app.refresh_panel();
+        app.next_prompt();
+        app
+    }
+
+    pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notice = Some((text.into(), error, Instant::now()));
     }
 
     pub fn layout(&self) -> Layout {
-        let body_h = self.height.saturating_sub(5).max(4); // header + input box (3) + hints
+        // The connections panel takes what it needs, up to a third of the screen.
+        let max_panel = (self.height / 3).max(3);
+        let panel_h = (self.panel.len() as u16 + 2).clamp(3, max_panel);
+        let body_h = self.height.saturating_sub(5 + panel_h).max(4); // header + input box (3) + hints
         if self.width < 80 {
             let th = body_h * 55 / 100;
             return Layout {
+                panel_h,
                 tree_w: self.width,
                 tree_h: th,
                 det_w: self.width,
@@ -113,6 +180,7 @@ impl App {
         }
         let tw = (self.width as u32 * 45 / 100) as u16;
         Layout {
+            panel_h,
             tree_w: tw,
             tree_h: body_h,
             det_w: self.width - tw,
@@ -149,7 +217,23 @@ impl App {
             self.rate_total = total;
             self.rate_at = Instant::now();
         }
+        if let Some((_, _, at)) = self.notice
+            && at.elapsed() > NOTICE_FOR
+        {
+            self.notice = None;
+        }
         self.rebuild(false);
+    }
+
+    fn refresh_panel(&mut self) {
+        let st = self.store.lock().unwrap();
+        self.panel.clear();
+        for (i, c) in st.conns.iter().enumerate() {
+            self.panel.push(PanelRow::Conn(i));
+            self.panel.extend((0..c.subs.len()).map(|j| PanelRow::Sub(i, j)));
+        }
+        drop(st);
+        self.panel_cursor = self.panel_cursor.min(self.panel.len().saturating_sub(1));
     }
 
     /// Recomputes visible rows if the tree, filter or expansion changed.
@@ -215,7 +299,9 @@ impl App {
         self.selected = self.rows.get(self.cursor).map(|r| r.node);
         if self.selected != prev {
             self.msg_sel = None;
-            self.focus = Focus::Tree;
+            if self.focus == Focus::Msgs {
+                self.focus = Focus::Tree;
+            }
         }
         let h = self.tree_height();
         if self.cursor < self.offset {
@@ -257,9 +343,33 @@ impl App {
     }
 
     pub fn paste(&mut self, s: &str) {
-        if self.viewer.is_none() {
+        if let Some(p) = &mut self.prompt {
+            p.input.push_str(s.trim_end_matches(['\r', '\n']));
+        } else if self.viewer.is_none() {
             let t = format!("{}{}", self.filter_text, s.trim());
             self.set_filter(t);
+        }
+    }
+
+    /// `tab` cycles connections → tree → messages (when the topic has any).
+    fn next_focus(&mut self, back: bool) {
+        let has_msgs = self
+            .selected
+            .is_some_and(|n| self.store.lock().unwrap().nodes[n].has_messages());
+        let order: &[Focus] = if has_msgs {
+            &[Focus::Conns, Focus::Tree, Focus::Msgs]
+        } else {
+            &[Focus::Conns, Focus::Tree]
+        };
+        let i = order.iter().position(|&f| f == self.focus).unwrap_or(1);
+        let n = order.len();
+        let next = order[if back { (i + n - 1) % n } else { (i + 1) % n }];
+        match next {
+            Focus::Msgs => self.enter_msgs(),
+            f => {
+                self.focus = f;
+                self.msg_sel = None;
+            }
         }
     }
 
@@ -269,8 +379,20 @@ impl App {
             self.quit = true;
             return;
         }
+        if self.prompt.is_some() {
+            self.prompt_key(k);
+            return;
+        }
         if self.viewer.is_some() {
             self.viewer_key(k);
+            return;
+        }
+        match k.code {
+            KeyCode::Tab => return self.next_focus(false),
+            KeyCode::BackTab => return self.next_focus(true),
+            _ => {}
+        }
+        if self.focus == Focus::Conns && self.panel_key(k) {
             return;
         }
         match k.code {
@@ -346,7 +468,6 @@ impl App {
                     self.cursor = i;
                 }
             }
-            KeyCode::Tab if has_msgs => self.enter_msgs(),
             KeyCode::Enter => {
                 if has_msgs {
                     self.open_viewer(n, None);
@@ -360,12 +481,114 @@ impl App {
         self.rebuild(false);
     }
 
+    // ── Connections panel ──────────────────────────────────────────────────
+
+    /// Handles a key in the panel; false lets it fall through (e.g. typing).
+    fn panel_key(&mut self, k: KeyEvent) -> bool {
+        let last = self.panel.len().saturating_sub(1);
+        match k.code {
+            KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+            KeyCode::Down => self.panel_cursor = (self.panel_cursor + 1).min(last),
+            KeyCode::Home => self.panel_cursor = 0,
+            KeyCode::End => self.panel_cursor = last,
+            KeyCode::Char(' ') | KeyCode::Enter => match self.panel.get(self.panel_cursor).copied() {
+                Some(PanelRow::Conn(i)) => self.toggle_conn(i),
+                Some(PanelRow::Sub(i, j)) => self.toggle_sub(i, j),
+                None => {}
+            },
+            KeyCode::Esc => self.focus = Focus::Tree,
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn toggle_conn(&mut self, i: usize) {
+        let state = self.store.lock().unwrap().conns[i].status.state;
+        if state == ConnState::Disconnected {
+            if self.ctls[i].needs_password() {
+                self.prompt = Some(Prompt {
+                    conn: i,
+                    input: String::new(),
+                });
+                return;
+            }
+            let password = self.ctls[i].password.clone();
+            let _ = self.ctls[i].tx.send(Cmd::Connect { password });
+        } else {
+            let _ = self.ctls[i].tx.send(Cmd::Disconnect);
+        }
+    }
+
+    pub fn toggle_sub(&mut self, i: usize, j: usize) {
+        let (topic, enabled) = {
+            let mut st = self.store.lock().unwrap();
+            let s = &mut st.conns[i].subs[j];
+            s.enabled = !s.enabled;
+            s.err = None;
+            (s.topic.clone(), s.enabled)
+        };
+        let ctl = &mut self.ctls[i];
+        let _ = ctl.tx.send(if enabled {
+            Cmd::Subscribe(topic.clone())
+        } else {
+            Cmd::Unsubscribe(topic.clone())
+        });
+        ctl.cfg.paused.retain(|t| t != &topic);
+        if !enabled {
+            ctl.cfg.paused.push(topic);
+        }
+        if ctl.saved
+            && let Err(e) = config::save(&self.config_path, &ctl.cfg)
+        {
+            self.notify(format!("couldn't save: {e}"), true);
+        }
+    }
+
+    fn next_prompt(&mut self) {
+        if self.prompt.is_none() && !self.prompt_queue.is_empty() {
+            let conn = self.prompt_queue.remove(0);
+            self.prompt = Some(Prompt {
+                conn,
+                input: String::new(),
+            });
+        }
+    }
+
+    fn prompt_key(&mut self, k: KeyEvent) {
+        let Some(p) = &mut self.prompt else { return };
+        match k.code {
+            KeyCode::Char(c) => p.input.push(c),
+            KeyCode::Backspace => {
+                p.input.pop();
+            }
+            KeyCode::Enter => {
+                let p = self.prompt.take().unwrap();
+                // An empty password connects with the username only.
+                let pw = (!p.input.is_empty()).then_some(p.input);
+                let ctl = &mut self.ctls[p.conn];
+                ctl.password = Some(pw.clone().unwrap_or_default());
+                let _ = ctl.tx.send(Cmd::Connect { password: pw });
+                self.next_prompt();
+            }
+            KeyCode::Esc => {
+                self.prompt = None;
+                self.next_prompt();
+            }
+            _ => {}
+        }
+    }
+
+    // ── Messages and viewer ────────────────────────────────────────────────
+
     fn enter_msgs(&mut self) {
         if let Some(n) = self.selected {
             let st = self.store.lock().unwrap();
-            self.msg_sel = st.nodes[n].latest().map(|m| m.seq);
+            let latest = st.nodes[n].latest().map(|m| m.seq);
             drop(st);
-            self.focus = Focus::Msgs;
+            if latest.is_some() {
+                self.msg_sel = latest;
+                self.focus = Focus::Msgs;
+            }
         }
     }
 
@@ -381,7 +604,7 @@ impl App {
             KeyCode::Down => i += 1,
             KeyCode::Home | KeyCode::PageUp => i = 0,
             KeyCode::End | KeyCode::PageDown => i = msgs.len() as isize - 1,
-            KeyCode::Left | KeyCode::Esc | KeyCode::Tab => {
+            KeyCode::Left | KeyCode::Esc => {
                 self.focus = Focus::Tree;
                 self.msg_sel = None;
                 return;
@@ -397,15 +620,16 @@ impl App {
     }
 
     fn open_viewer(&mut self, n: usize, sel: Option<u64>) {
-        let (msgs, path) = {
+        let (msgs, title) = {
             let st = self.store.lock().unwrap();
-            (st.nodes[n].messages(), st.nodes[n].path.clone())
+            let node = &st.nodes[n];
+            (node.messages(), node_title(&st, n))
         };
         if msgs.is_empty() {
             return;
         }
         let idx = msg_index(&msgs, sel);
-        let mut v = Viewer::new(path, msgs, idx);
+        let mut v = Viewer::new(title, msgs, idx);
         v.relayout(self.width.saturating_sub(4) as usize, &self.th);
         self.viewer = Some(v);
     }
@@ -423,6 +647,17 @@ impl App {
             Some(v) => (self.height as usize).saturating_sub(3 + v.head.len()).max(1),
             None => 0,
         }
+    }
+}
+
+/// "connection · topic/path" for a topic, or the connection name.
+pub fn node_title(st: &Store, n: usize) -> String {
+    let node = &st.nodes[n];
+    let conn = &st.conns[node.conn].name;
+    if node.is_conn() {
+        conn.clone()
+    } else {
+        format!("{conn} · {}", node.path)
     }
 }
 

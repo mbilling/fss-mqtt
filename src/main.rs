@@ -1,6 +1,7 @@
 //! fss-mqtt — interactive terminal MQTT explorer.
 
 mod app;
+mod config;
 mod fmt;
 mod mqtt;
 mod store;
@@ -11,6 +12,7 @@ mod viewer;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::stdout;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,10 +25,20 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "fss-mqtt — interactive MQTT explorer
 
 Usage:
-  fss-mqtt [flags] [broker]
+  fss-mqtt                     connect the saved connections marked autoconnect
+  fss-mqtt -c NAME [-c NAME]   connect these saved connections
+  fss-mqtt [flags] BROKER      connect to BROKER and save it as a connection
 
-Flags:
-  -b, --broker string        broker URL (mqtt://, mqtts://) or host[:port] (default \"mqtt://localhost:1883\")
+Connections live in a small file you can edit (see --config). Connecting to a
+broker on the command line adds or updates its entry; passwords are never
+written, use password_env in the file or type it when asked.
+
+Connection flags:
+  -b, --broker string        broker URL (mqtt://, mqtts://) or host[:port]
+  -c, --connection string    saved connection to connect (repeatable)
+      --name string          name to save the broker under (default user@host:port)
+      --no-save              don't add the broker to the connections file
+      --config path          connections file (default: see below)
       --cafile string        PEM file of CA certificates to trust (implies TLS)
       --cert string          client certificate PEM for mutual TLS
   -i, --client-id string     client id (default fss-mqtt-<random>)
@@ -45,10 +57,15 @@ Flags:
 Environment: FSS_MQTT_BROKER, FSS_MQTT_USERNAME, FSS_MQTT_PASSWORD, FSS_MQTT_CAFILE";
 
 struct Args {
-    broker: String,
+    broker: Option<String>,
+    connections: Vec<String>,
+    name: Option<String>,
+    no_save: bool,
+    config: Option<PathBuf>,
     topics: Vec<String>,
     username: Option<String>,
     password: Option<String>,
+    password_from_env: bool,
     client_id: Option<String>,
     qos: u8,
     history: usize,
@@ -71,10 +88,15 @@ fn main() {
 fn parse_args() -> Result<Option<Args>, String> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let mut a = Args {
-        broker: env("FSS_MQTT_BROKER").unwrap_or_else(|| "mqtt://localhost:1883".into()),
+        broker: env("FSS_MQTT_BROKER"),
+        connections: vec![],
+        name: None,
+        no_save: false,
+        config: None,
         topics: vec![],
         username: env("FSS_MQTT_USERNAME"),
         password: env("FSS_MQTT_PASSWORD"),
+        password_from_env: env("FSS_MQTT_PASSWORD").is_some(),
         client_id: None,
         qos: 0,
         history: 10,
@@ -109,10 +131,17 @@ fn parse_args() -> Result<Option<Args>, String> {
                 println!("fss-mqtt {VERSION}");
                 return Ok(None);
             }
-            "-b" | "--broker" => a.broker = val()?,
+            "-b" | "--broker" => a.broker = Some(val()?),
+            "-c" | "--connection" => a.connections.push(val()?),
+            "--name" => a.name = Some(val()?),
+            "--no-save" => a.no_save = true,
+            "--config" => a.config = Some(PathBuf::from(val()?)),
             "-t" | "--topic" => a.topics.push(val()?),
             "-u" | "--username" => a.username = Some(val()?),
-            "-P" | "--password" => a.password = Some(val()?),
+            "-P" | "--password" => {
+                a.password = Some(val()?);
+                a.password_from_env = false;
+            }
             "-i" | "--client-id" => a.client_id = Some(val()?),
             "-q" | "--qos" => {
                 a.qos = match val()?.as_str() {
@@ -131,11 +160,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--cert" => a.cert = Some(val()?),
             "--key" => a.key = Some(val()?),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown flag {s}\n\n{USAGE}")),
-            _ => a.broker = arg,
+            _ => a.broker = Some(arg),
         }
-    }
-    if a.topics.is_empty() {
-        a.topics.push("#".into());
     }
     Ok(Some(a))
 }
@@ -220,41 +246,209 @@ fn parse_broker(s: &str, tls_wanted: bool) -> Result<Broker, String> {
     })
 }
 
-fn run() -> Result<(), String> {
-    let Some(a) = parse_args()? else { return Ok(()) };
-    let b = parse_broker(&a.broker, a.ca_file.is_some() || a.cert.is_some())?;
-    let client_id = a.client_id.unwrap_or_else(|| {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u32(std::process::id());
-        format!("fss-mqtt-{:08x}", h.finish() as u32)
-    });
+fn random_client_id() -> String {
+    let mut h = RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    format!("fss-mqtt-{:08x}", h.finish() as u32)
+}
 
-    let cfg = mqtt::Config {
+/// The connection described by command-line flags, merged over a saved entry
+/// of the same name (flags win; topics are kept unless -t is given).
+fn cli_connection(a: &Args, b: &Broker, saved: Option<&config::ConnCfg>) -> config::ConnCfg {
+    let mut c = saved.cloned().unwrap_or_default();
+    c.name = a.name.clone().unwrap_or_else(|| {
+        let hp = b.display.split_once("://").map_or(b.display.as_str(), |(_, hp)| hp);
+        match &a.username {
+            Some(u) => format!("{u}@{hp}"),
+            None => hp.to_string(),
+        }
+    });
+    c.url = b.display.clone();
+    // File paths are saved absolute, so the entry works from any directory.
+    for (field, v) in [
+        (&mut c.cafile, &a.ca_file),
+        (&mut c.cert, &a.cert),
+        (&mut c.key, &a.key),
+    ] {
+        if let Some(p) = v {
+            *field = Some(absolute_path(p));
+        }
+    }
+    for (field, v) in [(&mut c.username, &a.username), (&mut c.client_id, &a.client_id)] {
+        if v.is_some() {
+            *field = v.clone();
+        }
+    }
+    if a.password_from_env {
+        c.password_env = Some("FSS_MQTT_PASSWORD".into());
+    }
+    c.insecure |= a.insecure;
+    if a.qos != 0 {
+        c.qos = a.qos;
+    }
+    if !a.topics.is_empty() {
+        c.paused.retain(|t| a.topics.contains(t));
+        c.topics = a.topics.clone();
+    }
+    if c.topics.is_empty() {
+        c.topics = vec!["#".into()];
+    }
+    c.autoconnect = true;
+    c
+}
+
+/// `~/x` and relative paths made absolute (the file need not exist).
+fn absolute_path(p: &str) -> String {
+    let p = config::expand(p);
+    std::path::absolute(&p)
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or(p)
+}
+
+fn mqtt_config(idx: usize, c: &config::ConnCfg, password: Option<String>) -> Result<mqtt::Config, String> {
+    let b = parse_broker(&c.url, c.cafile.is_some() || c.cert.is_some())?;
+    Ok(mqtt::Config {
+        conn: idx,
         host: b.host,
         port: b.port,
-        tls: b.tls || a.ca_file.is_some() || a.cert.is_some(),
-        ca_file: a.ca_file,
-        cert_file: a.cert,
-        key_file: a.key,
-        insecure: a.insecure,
-        client_id,
-        username: a.username,
-        password: a.password,
-        topics: a.topics.clone(),
-        qos: a.qos,
-    };
-    let tls = mqtt::tls_config(&cfg)?;
+        tls: b.tls || c.cafile.is_some() || c.cert.is_some(),
+        ca_file: c.cafile.as_deref().map(config::expand),
+        cert_file: c.cert.as_deref().map(config::expand),
+        key_file: c.key.as_deref().map(config::expand),
+        insecure: c.insecure,
+        client_id: c.client_id.clone().unwrap_or_else(random_client_id),
+        username: c.username.clone(),
+        password,
+        qos: c.qos,
+    })
+}
+
+fn run() -> Result<(), String> {
+    let Some(a) = parse_args()? else { return Ok(()) };
+    let path = a.config.clone().unwrap_or_else(config::default_path);
+    let mut entries = config::load(&path)?;
+    let mut notice: Option<(String, bool)> = None;
+
+    // Decide which connections to show and which to start.
+    let mut cli_idx = None;
+    let mut saved: Vec<bool> = vec![true; entries.len()];
+    let mut start: Vec<bool>;
+    if let Some(broker) = &a.broker {
+        let b = parse_broker(broker, a.ca_file.is_some() || a.cert.is_some())?;
+        let name = a.name.clone();
+        let existing = entries.iter().position(|e| {
+            Some(&e.name) == name.as_ref() || (name.is_none() && cli_connection(&a, &b, None).name == e.name)
+        });
+        let c = cli_connection(&a, &b, existing.map(|i| &entries[i]));
+        // Fail fast on a bad cafile/cert for the broker you just typed.
+        mqtt::tls_config(&mqtt_config(0, &c, None)?).map_err(|e| format!("{}: {e}", c.name))?;
+        let i = match existing {
+            Some(i) => {
+                entries[i] = c;
+                i
+            }
+            None => {
+                entries.push(c);
+                saved.push(!a.no_save);
+                entries.len() - 1
+            }
+        };
+        if !a.no_save {
+            saved[i] = true;
+            match config::save(&path, &entries[i]) {
+                Ok(()) => {
+                    notice = Some((
+                        format!("saved connection {:?} to {}", entries[i].name, path.display()),
+                        false,
+                    ))
+                }
+                Err(e) => notice = Some((format!("couldn't save connection: {e}"), true)),
+            }
+        }
+        start = (0..entries.len()).map(|j| j == i).collect();
+        start
+            .iter_mut()
+            .zip(&entries)
+            .for_each(|(s, e)| *s |= a.connections.contains(&e.name));
+        cli_idx = Some(i);
+    } else if !a.connections.is_empty() {
+        for n in &a.connections {
+            if !entries.iter().any(|e| &e.name == n) {
+                let known: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+                return Err(format!(
+                    "no connection named {n:?} in {} (have: {})",
+                    path.display(),
+                    known.join(", ")
+                ));
+            }
+        }
+        start = entries.iter().map(|e| a.connections.contains(&e.name)).collect();
+    } else if entries.is_empty() {
+        // First run: a local broker, not saved.
+        entries.push(config::ConnCfg {
+            name: "localhost".into(),
+            url: "mqtt://localhost:1883".into(),
+            topics: if a.topics.is_empty() {
+                vec!["#".into()]
+            } else {
+                a.topics.clone()
+            },
+            autoconnect: true,
+            ..Default::default()
+        });
+        saved.push(false);
+        start = vec![true];
+    } else {
+        start = entries.iter().map(|e| e.autoconnect).collect();
+    }
 
     let store = Arc::new(Mutex::new(store::Store::new(a.history, a.max_payload)));
-    mqtt::spawn(cfg, tls, store.clone());
+    let mut ctls = Vec::new();
+    let mut ask = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let password = if Some(i) == cli_idx && a.password.is_some() {
+            a.password.clone()
+        } else {
+            e.password_env.as_deref().and_then(|v| std::env::var(v).ok())
+        };
+        let subs = e
+            .topics
+            .iter()
+            .map(|t| store::Sub {
+                topic: t.clone(),
+                enabled: !e.paused.contains(t),
+                err: None,
+            })
+            .collect();
+        let cfg = mqtt_config(i, e, password.clone()).map_err(|err| format!("connection {:?}: {err}", e.name))?;
+        let display = parse_broker(&e.url, e.cafile.is_some() || e.cert.is_some())?.display;
+        let idx = store
+            .lock()
+            .unwrap()
+            .add_conn(&e.name, &display, e.username.clone(), subs);
+        debug_assert_eq!(idx, i);
+        // A connection that needs a password we don't have waits for the prompt.
+        let needs_password = e.username.is_some() && password.is_none();
+        if start[i] && needs_password {
+            ask.push(i);
+        }
+        let tx = mqtt::spawn(cfg, store.clone(), start[i] && !needs_password);
+        ctls.push(app::ConnCtl {
+            cfg: e.clone(),
+            saved: saved[i],
+            tx,
+            password,
+        });
+    }
 
     let opts = app::Options {
-        broker: b.display,
-        topics: a.topics,
         preview_bytes: a.preview,
         inline_bytes: a.inline,
     };
-    let mut app = app::App::new(store, opts, theme::Theme::detect());
+    let mut app = app::App::new(store, opts, theme::Theme::detect(), ctls, path, ask);
+    if let Some((text, err)) = notice {
+        app.notify(text, err);
+    }
 
     let mut terminal = ratatui::init();
     let _ = execute!(stdout(), EnableBracketedPaste);
@@ -308,5 +502,18 @@ mod tests {
         assert!(parse_broker("wss://x", false).is_err());
         assert_eq!(parse_size("64KiB"), Ok(65536));
         assert_eq!(parse_size("2m"), Ok(2 << 20));
+    }
+
+    #[test]
+    fn paths_saved_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            absolute_path("secrets/ca.pem"),
+            cwd.join("secrets/ca.pem").to_string_lossy()
+        );
+        let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap();
+        assert!(absolute_path("~/ca.pem").starts_with(&home));
+        let abs = cwd.join("x.pem").to_string_lossy().into_owned();
+        assert_eq!(absolute_path(&abs), abs);
     }
 }

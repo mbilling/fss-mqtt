@@ -1,8 +1,10 @@
 //! A minimal MQTT v5 subscriber: connect (TCP or TLS), subscribe, receive,
-//! keep alive, reconnect. Blocking I/O on one thread.
+//! keep alive, reconnect. One blocking thread per connection, steered by
+//! [`Cmd`]s from the UI.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use crate::store::{ConnState, Props, Status, Store};
 
 pub struct Config {
+    pub conn: usize, // index into Store::conns
     pub host: String,
     pub port: u16,
     pub tls: bool,
@@ -22,14 +25,22 @@ pub struct Config {
     pub client_id: String,
     pub username: Option<String>,
     pub password: Option<String>,
-    pub topics: Vec<String>,
     pub qos: u8,
+}
+
+/// What the UI can ask a connection to do. Which topics to subscribe on
+/// connect is read from the connection's `subs` in the store.
+pub enum Cmd {
+    Connect { password: Option<String> },
+    Disconnect,
+    Subscribe(String),
+    Unsubscribe(String),
 }
 
 const KEEP_ALIVE: u16 = 30;
 const RETRY: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Builds the TLS config up front so bad cert paths fail at startup.
 pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, String> {
     if !cfg.tls {
         return Ok(None);
@@ -48,14 +59,14 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Str
         match &cfg.ca_file {
             Some(path) => {
                 let certs: Vec<_> = CertificateDer::pem_file_iter(path)
-                    .map_err(|e| format!("--cafile: {e}"))?
+                    .map_err(|e| format!("cafile {path}: {e}"))?
                     .collect::<Result<_, _>>()
-                    .map_err(|e| format!("--cafile: {e}"))?;
+                    .map_err(|e| format!("cafile {path}: {e}"))?;
                 if certs.is_empty() {
-                    return Err(format!("--cafile: no PEM certificates found in {path}"));
+                    return Err(format!("cafile {path}: no PEM certificates found"));
                 }
                 for c in certs {
-                    roots.add(c).map_err(|e| format!("--cafile: {e}"))?;
+                    roots.add(c).map_err(|e| format!("cafile {path}: {e}"))?;
                 }
             }
             None => {
@@ -70,16 +81,16 @@ pub fn tls_config(cfg: &Config) -> Result<Option<Arc<rustls::ClientConfig>>, Str
     let config = match (&cfg.cert_file, &cfg.key_file) {
         (Some(cert), Some(key)) => {
             let chain: Vec<_> = CertificateDer::pem_file_iter(cert)
-                .map_err(|e| format!("--cert: {e}"))?
+                .map_err(|e| format!("cert {cert}: {e}"))?
                 .collect::<Result<_, _>>()
-                .map_err(|e| format!("--cert: {e}"))?;
-            let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("--key: {e}"))?;
+                .map_err(|e| format!("cert {cert}: {e}"))?;
+            let key = PrivateKeyDer::from_pem_file(key).map_err(|e| format!("key {key}: {e}"))?;
             builder
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| format!("client certificate: {e}"))?
         }
         (None, None) => builder.with_no_client_auth(),
-        _ => return Err("--cert and --key must be given together".into()),
+        _ => return Err("cert and key must be given together".into()),
     };
     Ok(Some(Arc::new(config)))
 }
@@ -157,36 +168,99 @@ impl Write for Conn {
     }
 }
 
-/// Runs forever on its own thread, reconnecting after failures.
-pub fn spawn(cfg: Config, tls: Option<Arc<rustls::ClientConfig>>, store: Arc<Mutex<Store>>) {
+/// How a session ended.
+enum End {
+    Failed(String), // retry after a pause
+    Stopped,        // the UI asked to disconnect
+    Closed,         // the UI is gone
+}
+
+/// Starts the connection's thread. It connects now if `start`, then follows
+/// commands; after a failure it retries every few seconds until told to stop.
+pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut want = start;
         loop {
-            let err = session(&cfg, &tls, &store);
-            let mut st = store.lock().unwrap();
-            let was_up = st.status.state == ConnState::Connected;
-            st.status = Status {
-                state: if was_up {
-                    ConnState::Disconnected
-                } else {
-                    ConnState::Connecting
-                },
-                err: Some(err),
-            };
-            drop(st);
-            std::thread::sleep(RETRY);
+            if !want {
+                set_status(&store, cfg.conn, ConnState::Disconnected, None);
+                match rx.recv() {
+                    Ok(Cmd::Connect { password }) => {
+                        if password.is_some() {
+                            cfg.password = password;
+                        }
+                        want = true;
+                    }
+                    Ok(_) => continue, // subscription changes apply on the next connect
+                    Err(_) => return,
+                }
+            }
+            set_status(&store, cfg.conn, ConnState::Connecting, None);
+            match session(&cfg, &store, &rx) {
+                End::Stopped => want = false,
+                End::Closed => return,
+                End::Failed(err) => {
+                    set_status(&store, cfg.conn, ConnState::Connecting, Some(err));
+                    // Pause before retrying, but stay responsive.
+                    let until = Instant::now() + RETRY;
+                    loop {
+                        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                            Ok(Cmd::Disconnect) => {
+                                want = false;
+                                break;
+                            }
+                            Ok(Cmd::Connect { password }) => {
+                                if password.is_some() {
+                                    cfg.password = password;
+                                }
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                }
+            }
         }
     });
+    tx
 }
 
-fn set_status(store: &Mutex<Store>, state: ConnState, err: Option<String>) {
-    store.lock().unwrap().status = Status { state, err };
+fn set_status(store: &Mutex<Store>, conn: usize, state: ConnState, err: Option<String>) {
+    store.lock().unwrap().conns[conn].status = Status { state, err };
 }
 
-/// One connection's lifetime. Returns why it ended.
-fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<Store>) -> String {
-    let tcp = match TcpStream::connect((cfg.host.as_str(), cfg.port)) {
+fn set_sub_err(store: &Mutex<Store>, conn: usize, topic: &str, err: Option<String>) {
+    let mut st = store.lock().unwrap();
+    if let Some(s) = st.conns[conn].subs.iter_mut().find(|s| s.topic == topic) {
+        s.err = err;
+    }
+}
+
+fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}: {e}"))?;
+    let mut last = format!("resolve {host}: no addresses");
+    for a in addrs {
+        match TcpStream::connect_timeout(&a, CONNECT_TIMEOUT) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = format!("connect {host}:{port}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// One connection's lifetime.
+fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
+    let tls = match tls_config(cfg) {
+        Ok(t) => t,
+        Err(e) => return End::Failed(e),
+    };
+    let tcp = match dial(&cfg.host, cfg.port) {
         Ok(s) => s,
-        Err(e) => return format!("connect {}:{}: {e}", cfg.host, cfg.port),
+        Err(e) => return End::Failed(e),
     };
     let _ = tcp.set_nodelay(true);
     let mut conn = match tls {
@@ -194,28 +268,28 @@ fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<
         Some(tc) => {
             let name = match ServerName::try_from(cfg.host.clone()) {
                 Ok(n) => n,
-                Err(e) => return format!("tls: {e}"),
+                Err(e) => return End::Failed(format!("tls: {e}")),
             };
-            match rustls::ClientConnection::new(tc.clone(), name) {
+            match rustls::ClientConnection::new(tc, name) {
                 Ok(c) => Conn::Tls(Box::new(rustls::StreamOwned::new(c, tcp))),
-                Err(e) => return format!("tls: {e}"),
+                Err(e) => return End::Failed(format!("tls: {e}")),
             }
         }
     };
-    let _ = conn.tcp().set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = conn.tcp().set_read_timeout(Some(CONNECT_TIMEOUT));
 
     if let Err(e) = conn.write_all(&connect_packet(cfg)).and_then(|_| conn.flush()) {
-        return tidy_io(e);
+        return End::Failed(tidy_io(e));
     }
 
     let mut rd = Reader::default();
     let (kind, body) = match rd.next(&mut conn) {
         Ok(Some(p)) => p,
-        Ok(None) => return "timed out waiting for CONNACK".into(),
-        Err(e) => return tidy_io(e),
+        Ok(None) => return End::Failed("timed out waiting for CONNACK".into()),
+        Err(e) => return End::Failed(tidy_io(e)),
     };
     if kind >> 4 != 2 || body.len() < 2 {
-        return "unexpected reply to CONNECT".into();
+        return End::Failed("unexpected reply to CONNECT".into());
     }
     let mut keep_alive = KEEP_ALIVE;
     let mut reason_str = None;
@@ -234,31 +308,68 @@ fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<
         if let Some(r) = reason_str {
             msg += &format!(": {r}");
         }
-        return msg;
+        return End::Failed(msg);
     }
-    set_status(store, ConnState::Connected, None);
+    set_status(store, cfg.conn, ConnState::Connected, None);
 
+    let mut next_pid: u16 = 0;
+    let mut pid = || {
+        next_pid = next_pid.wrapping_add(1).max(1);
+        next_pid
+    };
     // One SUBSCRIBE per filter, so a refused one is named and the rest work.
     let mut pending: Vec<(u16, String)> = Vec::new();
-    for (i, t) in cfg.topics.iter().enumerate() {
-        let pid = i as u16 + 1;
-        if let Err(e) = conn.write_all(&subscribe_packet(pid, t, cfg.qos)) {
-            return tidy_io(e);
+    let topics: Vec<String> = {
+        let mut st = store.lock().unwrap();
+        let c = &mut st.conns[cfg.conn];
+        c.subs.iter_mut().for_each(|s| s.err = None);
+        c.subs.iter().filter(|s| s.enabled).map(|s| s.topic.clone()).collect()
+    };
+    for t in topics {
+        let p = pid();
+        if let Err(e) = conn.write_all(&subscribe_packet(p, &t, cfg.qos)) {
+            return End::Failed(tidy_io(e));
         }
-        pending.push((pid, t.clone()));
+        pending.push((p, t));
     }
     let _ = conn.flush();
-    let mut denied: Vec<String> = Vec::new();
 
-    let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = conn.tcp().set_read_timeout(Some(Duration::from_millis(100)));
     let ping_every = Duration::from_secs((keep_alive.max(2) as u64) * 3 / 4);
     let mut last_send = Instant::now();
     let mut last_recv = Instant::now();
 
     loop {
+        // Commands from the UI.
+        loop {
+            let cmd = match rx.try_recv() {
+                Ok(c) => c,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return End::Closed,
+            };
+            let out = match cmd {
+                Cmd::Disconnect => {
+                    let _ = conn.write_all(&[0xE0, 0]).and_then(|_| conn.flush());
+                    return End::Stopped;
+                }
+                Cmd::Connect { .. } => continue,
+                Cmd::Subscribe(t) => {
+                    let p = pid();
+                    let pkt = subscribe_packet(p, &t, cfg.qos);
+                    pending.push((p, t));
+                    pkt
+                }
+                Cmd::Unsubscribe(t) => unsubscribe_packet(pid(), &t),
+            };
+            if let Err(e) = conn.write_all(&out).and_then(|_| conn.flush()) {
+                return End::Failed(tidy_io(e));
+            }
+            last_send = Instant::now();
+        }
+
         let pkt = match rd.next(&mut conn) {
             Ok(p) => p,
-            Err(e) => return tidy_io(e),
+            Err(e) => return End::Failed(tidy_io(e)),
         };
         if let Some((kind, body)) = pkt {
             last_recv = Instant::now();
@@ -268,9 +379,9 @@ fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<
                     let qos = (kind >> 1) & 3;
                     let retain = kind & 1 == 1;
                     let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
-                        return "malformed PUBLISH".into();
+                        return End::Failed("malformed PUBLISH".into());
                     };
-                    store.lock().unwrap().add(&topic, payload, qos, retain, props);
+                    store.lock().unwrap().add(cfg.conn, &topic, payload, qos, retain, props);
                     match qos {
                         1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
                         2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),
@@ -280,33 +391,25 @@ fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<
                 6 if body.len() >= 2 => reply = Some([0x70, 2, body[0], body[1]]), // PUBREL → PUBCOMP
                 9 if body.len() >= 2 => {
                     // SUBACK
-                    let pid = u16::from_be_bytes([body[0], body[1]]);
+                    let p = u16::from_be_bytes([body[0], body[1]]);
                     let mut b = Buf(&body[2..]);
                     let _ = b.props();
                     let code = b.0.first().copied().unwrap_or(0x80);
-                    if let Some(i) = pending.iter().position(|(p, _)| *p == pid) {
+                    if let Some(i) = pending.iter().position(|(q, _)| *q == p) {
                         let (_, t) = pending.remove(i);
-                        if code >= 0x80 {
-                            denied.push(format!("{t} ({})", suback_reason(code)));
-                        }
-                    }
-                    if pending.is_empty() && !denied.is_empty() {
-                        set_status(
-                            store,
-                            ConnState::Connected,
-                            Some(format!("subscribe refused: {}", denied.join(", "))),
-                        );
+                        let err = (code >= 0x80).then(|| suback_reason(code));
+                        set_sub_err(store, cfg.conn, &t, err);
                     }
                 }
                 14 => {
                     let code = body.first().copied().unwrap_or(0);
-                    return format!("broker disconnected: {}", connack_reason(code));
+                    return End::Failed(format!("broker disconnected: {}", connack_reason(code)));
                 }
                 _ => {}
             }
             if let Some(r) = reply {
                 if let Err(e) = conn.write_all(&r) {
-                    return tidy_io(e);
+                    return End::Failed(tidy_io(e));
                 }
                 last_send = Instant::now();
             }
@@ -317,12 +420,12 @@ fn session(cfg: &Config, tls: &Option<Arc<rustls::ClientConfig>>, store: &Mutex<
         }
         if last_send.elapsed() >= ping_every {
             if let Err(e) = conn.write_all(&[0xC0, 0]).and_then(|_| conn.flush()) {
-                return tidy_io(e);
+                return End::Failed(tidy_io(e));
             }
             last_send = Instant::now();
         }
         if last_recv.elapsed() > Duration::from_secs(keep_alive.max(2) as u64 * 2) {
-            return "keepalive timeout".into();
+            return End::Failed("keepalive timeout".into());
         }
     }
 }
@@ -451,6 +554,14 @@ fn connect_packet(cfg: &Config) -> Vec<u8> {
         put_str(&mut b, p.as_bytes());
     }
     packet(0x10, b)
+}
+
+fn unsubscribe_packet(pid: u16, topic: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&pid.to_be_bytes());
+    b.push(0); // no properties
+    put_str(&mut b, topic.as_bytes());
+    packet(0xA2, b)
 }
 
 fn subscribe_packet(pid: u16, topic: &str, qos: u8) -> Vec<u8> {
@@ -642,15 +753,27 @@ mod tests {
 
 /// Needs mosquitto on 127.0.0.1:18830 (plain) and localhost:18883 (TLS, with
 /// the CA in $FSS_TEST_CA). CI runs it; locally:
-/// FSS_TEST_CA=ca.pem cargo test --release e2e -- --ignored --nocapture
+/// scripts/e2e-brokers.sh /tmp/b && FSS_TEST_CA=/tmp/b/ca.pem cargo test --release e2e -- --ignored
 #[cfg(test)]
 mod e2e {
     use super::*;
-    use crate::store::Message;
+    use crate::store::{Message, Sub};
     use std::process::Command;
 
-    fn cfg(port: u16, tls: bool, ca: Option<&str>, id: &str) -> Config {
-        Config {
+    fn sub(t: &str) -> Sub {
+        Sub {
+            topic: t.into(),
+            enabled: true,
+            err: None,
+        }
+    }
+
+    /// A store with one connection subscribed to `topics`, and its config.
+    fn setup(port: u16, tls: bool, ca: Option<&str>, topics: &[&str]) -> (Arc<Mutex<Store>>, Config) {
+        let mut st = Store::new(10, 64 * 1024);
+        let conn = st.add_conn("t", "test", None, topics.iter().map(|t| sub(t)).collect());
+        let cfg = Config {
+            conn,
             host: if tls { "localhost".into() } else { "127.0.0.1".into() },
             port,
             tls,
@@ -658,29 +781,33 @@ mod e2e {
             cert_file: None,
             key_file: None,
             insecure: false,
-            client_id: id.into(),
+            client_id: format!("e2e-{port}-{}", ca.is_some()),
             username: None,
             password: None,
-            topics: vec!["#".into()],
             qos: 2,
-        }
+        };
+        (Arc::new(Mutex::new(st)), cfg)
     }
 
-    /// Waits until connected and subscribed, or until an error is reported.
-    fn wait_status(st: &Arc<Mutex<Store>>) -> Status {
+    fn status(st: &Arc<Mutex<Store>>) -> Status {
+        st.lock().unwrap().conns[0].status.clone()
+    }
+
+    /// Waits for `state` (or an error), then a moment for SUBACKs to land.
+    fn wait_state(st: &Arc<Mutex<Store>>, state: ConnState) -> Status {
         for _ in 0..50 {
-            let s = st.lock().unwrap().status.clone();
-            if s.state == ConnState::Connected || s.err.is_some() {
-                std::thread::sleep(Duration::from_millis(300)); // let SUBACK land
-                return st.lock().unwrap().status.clone();
+            let s = status(st);
+            if s.state == state || s.err.is_some() {
+                std::thread::sleep(Duration::from_millis(300));
+                return status(st);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        st.lock().unwrap().status.clone()
+        status(st)
     }
 
     fn wait_for(st: &Arc<Mutex<Store>>, total: u64) -> u64 {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         loop {
             let n = st.lock().unwrap().total();
             if n >= total || start.elapsed() > Duration::from_secs(10) {
@@ -703,7 +830,7 @@ mod e2e {
         let st = st.lock().unwrap();
         st.nodes
             .iter()
-            .find(|n| n.path == path)
+            .find(|n| n.depth > 1 && n.path == path)
             .and_then(|n| n.latest().cloned())
     }
 
@@ -711,9 +838,9 @@ mod e2e {
     #[ignore]
     fn e2e() {
         // Plain TCP: QoS 1 and 2 with v5 properties.
-        let st = Arc::new(Mutex::new(Store::new(10, 64 * 1024)));
-        spawn(cfg(18830, false, None, "e2e-plain"), None, st.clone());
-        let s = wait_status(&st);
+        let (st, cfg) = setup(18830, false, None, &["e2e/#"]);
+        let tx = spawn(cfg, st.clone(), true);
+        let s = wait_state(&st, ConnState::Connected);
         assert!(
             s.state == ConnState::Connected && s.err.is_none(),
             "plain connect: {:?}",
@@ -722,26 +849,11 @@ mod e2e {
 
         for q in ["1", "2"] {
             let topic = format!("e2e/plant/qos{q}");
+            #[rustfmt::skip]
             publish(&[
-                "-p",
-                "18830",
-                "-V",
-                "mqttv5",
-                "-q",
-                q,
-                "-t",
-                &topic,
-                "-m",
-                r#"{"t":21.5}"#,
-                "-D",
-                "publish",
-                "user-property",
-                "site",
-                "oslo",
-                "-D",
-                "publish",
-                "content-type",
-                "application/json",
+                "-p", "18830", "-V", "mqttv5", "-q", q, "-t", &topic, "-m", r#"{"t":21.5}"#,
+                "-D", "publish", "user-property", "site", "oslo",
+                "-D", "publish", "content-type", "application/json",
             ]);
         }
         assert_eq!(wait_for(&st, 2), 2);
@@ -766,13 +878,32 @@ mod e2e {
         assert!(ok);
         assert_eq!(wait_for(&st, n + 2), n + 2, "burst incomplete");
 
+        // Subscribe to more at runtime, then unsubscribe: delivery starts and stops.
+        let before = st.lock().unwrap().total();
+        tx.send(Cmd::Subscribe("live/#".into())).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        publish(&["-p", "18830", "-q", "1", "-t", "live/a", "-m", "1"]);
+        assert_eq!(wait_for(&st, before + 1), before + 1, "runtime subscribe");
+        tx.send(Cmd::Unsubscribe("live/#".into())).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        publish(&["-p", "18830", "-q", "1", "-t", "live/a", "-m", "2"]);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(st.lock().unwrap().total(), before + 1, "message after unsubscribe");
+
+        // Disconnect keeps the data; reconnect resubscribes.
+        tx.send(Cmd::Disconnect).unwrap();
+        assert_eq!(wait_state(&st, ConnState::Disconnected).state, ConnState::Disconnected);
+        assert_eq!(st.lock().unwrap().total(), before + 1, "data kept after disconnect");
+        tx.send(Cmd::Connect { password: None }).unwrap();
+        assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
+        publish(&["-p", "18830", "-q", "1", "-t", "e2e/again", "-m", "x"]);
+        assert_eq!(wait_for(&st, before + 2), before + 2, "after reconnect");
+
         // TLS with the test CA connects and receives; without it the cert is refused.
         let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");
-        let st = Arc::new(Mutex::new(Store::new(10, 1024)));
-        let c = cfg(18883, true, Some(&ca), "e2e-tls");
-        let tls = tls_config(&c).unwrap();
-        spawn(c, tls, st.clone());
-        let s = wait_status(&st);
+        let (st, cfg) = setup(18883, true, Some(&ca), &["#"]);
+        let _tx = spawn(cfg, st.clone(), true);
+        let s = wait_state(&st, ConnState::Connected);
         assert!(
             s.state == ConnState::Connected && s.err.is_none(),
             "tls connect: {:?}",
@@ -792,11 +923,9 @@ mod e2e {
         ]);
         assert_eq!(wait_for(&st, 1), 1);
 
-        let st = Arc::new(Mutex::new(Store::new(10, 1024)));
-        let c = cfg(18883, true, None, "e2e-tls-noca");
-        let tls = tls_config(&c).unwrap();
-        spawn(c, tls, st.clone());
-        let s = wait_status(&st);
+        let (st, cfg) = setup(18883, true, None, &["#"]);
+        let _tx = spawn(cfg, st.clone(), true);
+        let s = wait_state(&st, ConnState::Connected);
         assert!(s.state != ConnState::Connected, "connected without trusting the CA");
         let err = s.err.unwrap_or_default();
         assert!(

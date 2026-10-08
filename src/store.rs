@@ -1,7 +1,9 @@
 //! The live topic tree and the last N messages per topic.
 //!
-//! Written by the MQTT thread, read by the UI, always behind one Mutex.
+//! Written by the MQTT threads, read by the UI, always behind one Mutex.
 //! Nodes live in an arena and are never removed, so node ids stay valid.
+//! Each connection owns one top-level node; topic paths below it don't
+//! include the connection name.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -40,7 +42,8 @@ pub struct Node {
     pub name: String,
     pub path: String,
     pub parent: Option<usize>,
-    pub depth: usize, // root 0, top level 1
+    pub depth: usize, // root 0, connections 1, top-level topics 2
+    pub conn: usize,  // index into Store::conns
     lower_name: String,
     lower_path: String,
     children: HashMap<String, usize>,
@@ -54,12 +57,13 @@ pub struct Node {
 }
 
 impl Node {
-    fn new(name: &str, path: &str, parent: Option<usize>, depth: usize) -> Node {
+    fn new(name: &str, path: &str, parent: Option<usize>, depth: usize, conn: usize) -> Node {
         Node {
             name: name.to_string(),
             path: path.to_string(),
             parent,
             depth,
+            conn,
             lower_name: name.to_lowercase(),
             lower_path: path.to_lowercase(),
             children: HashMap::new(),
@@ -71,6 +75,9 @@ impl Node {
             topics: 0,
             last_seen: SystemTime::UNIX_EPOCH,
         }
+    }
+    pub fn is_conn(&self) -> bool {
+        self.depth == 1
     }
     pub fn has_children(&self) -> bool {
         !self.children.is_empty()
@@ -93,7 +100,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConnState {
     Connecting,
     Connected,
@@ -106,28 +113,64 @@ pub struct Status {
     pub err: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct Sub {
+    pub topic: String,
+    pub enabled: bool,
+    pub err: Option<String>, // why the broker refused it
+}
+
+pub struct ConnInfo {
+    pub name: String,
+    pub url: String, // for display; no credentials
+    pub username: Option<String>,
+    pub node: usize,
+    pub status: Status,
+    pub subs: Vec<Sub>,
+}
+
 pub struct Store {
     pub nodes: Vec<Node>,
+    pub conns: Vec<ConnInfo>,
     history: usize,
     max_payload: usize,
     seq: u64,
     pub struct_ver: u64,
-    pub status: Status,
 }
 
 impl Store {
     pub fn new(history: usize, max_payload: usize) -> Store {
         Store {
-            nodes: vec![Node::new("", "", None, 0)],
+            nodes: vec![Node::new("", "", None, 0, 0)],
+            conns: Vec::new(),
             history: history.max(1),
             max_payload,
             seq: 0,
             struct_ver: 0,
+        }
+    }
+
+    /// Registers a connection and its top-level node; returns its index.
+    pub fn add_conn(&mut self, name: &str, url: &str, username: Option<String>, subs: Vec<Sub>) -> usize {
+        let idx = self.conns.len();
+        let id = self.nodes.len();
+        self.nodes.push(Node::new(name, "", Some(ROOT), 1, idx));
+        let root = &mut self.nodes[ROOT];
+        root.children.insert(name.to_string(), id);
+        root.sorted_dirty = true;
+        self.struct_ver += 1;
+        self.conns.push(ConnInfo {
+            name: name.to_string(),
+            url: url.to_string(),
+            username,
+            node: id,
             status: Status {
-                state: ConnState::Connecting,
+                state: ConnState::Disconnected,
                 err: None,
             },
-        }
+            subs,
+        });
+        idx
     }
 
     pub fn total(&self) -> u64 {
@@ -137,7 +180,7 @@ impl Store {
         self.nodes[ROOT].topics
     }
 
-    pub fn add(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool, props: Props) {
+    pub fn add(&mut self, conn: usize, topic: &str, payload: &[u8], qos: u8, retain: bool, props: Props) {
         let keep = payload.len().min(self.max_payload);
         self.seq += 1;
         let now = SystemTime::now();
@@ -151,7 +194,7 @@ impl Store {
             props,
         });
 
-        let mut n = ROOT;
+        let mut n = self.conns[conn].node;
         let mut start = 0;
         for seg in topic.split('/') {
             let end = start + seg.len();
@@ -160,7 +203,7 @@ impl Store {
                 None => {
                     let id = self.nodes.len();
                     let depth = self.nodes[n].depth + 1;
-                    self.nodes.push(Node::new(seg, &topic[..end], Some(n), depth));
+                    self.nodes.push(Node::new(seg, &topic[..end], Some(n), depth, conn));
                     let p = &mut self.nodes[n];
                     p.children.insert(seg.to_string(), id);
                     p.sorted_dirty = true;
@@ -298,12 +341,19 @@ impl Filter {
             marks: vec![0; st.nodes.len()],
             topics: 0,
         };
-        if self.mode == FilterMode::Search {
-            for &c in st.nodes[ROOT].children() {
-                v.search(c);
+        // Connections are the top level; filters match the topics below them.
+        for &c in st.nodes[ROOT].children() {
+            if self.mode == FilterMode::Search {
+                let mut any = false;
+                for &t in st.nodes[c].children() {
+                    any |= v.search(t);
+                }
+                if any {
+                    v.marks[c] |= VISIBLE;
+                }
+            } else {
+                v.pattern(c, 0);
             }
-        } else {
-            v.pattern(ROOT, 0);
         }
         (Some(v.marks), v.topics)
     }
@@ -431,8 +481,9 @@ mod tests {
 
     fn store(topics: &[&str]) -> Store {
         let mut s = Store::new(3, 8);
+        s.add_conn("broker", "mqtt://x:1883", None, vec![]);
         for t in topics {
-            s.add(t, format!("payload-{t}").as_bytes(), 0, false, Props::default());
+            s.add(0, t, format!("payload-{t}").as_bytes(), 0, false, Props::default());
         }
         s.sort_children();
         s
@@ -442,6 +493,7 @@ mod tests {
         let (marks, _) = Filter::compile(f).visibility(s);
         flatten(s, marks.as_deref(), &|_, _| true)
             .iter()
+            .filter(|r| !s.nodes[r.node].is_conn())
             .map(|r| s.nodes[r.node].path.clone())
             .collect()
     }
@@ -491,13 +543,50 @@ mod tests {
         }
     }
 
+    fn find<'a>(s: &'a Store, conn: usize, path: &str) -> &'a Node {
+        s.nodes
+            .iter()
+            .find(|n| n.conn == conn && n.depth > 1 && n.path == path)
+            .expect(path)
+    }
+
+    #[test]
+    fn connections_are_separate_branches() {
+        let mut s = Store::new(10, 64);
+        s.add_conn("local", "mqtt://a:1883", None, vec![]);
+        s.add_conn("staging", "mqtt://b:1883", None, vec![]);
+        s.add(0, "devices/d1/temp", b"1", 0, false, Props::default());
+        s.add(1, "devices/d1/temp", b"2", 0, false, Props::default());
+        s.add(1, "other/x", b"3", 0, false, Props::default());
+        s.sort_children();
+        assert_eq!(find(&s, 0, "devices/d1/temp").latest().unwrap().payload, b"1");
+        assert_eq!(find(&s, 1, "devices/d1/temp").latest().unwrap().payload, b"2");
+        assert_eq!(s.nodes[s.conns[1].node].topics, 2);
+        assert_eq!((s.topic_count(), s.total()), (3, 3));
+
+        // A pattern matches under every connection, and the connection rows show.
+        let (marks, matched) = Filter::compile("devices/#").visibility(&s);
+        assert_eq!(matched, 2);
+        let rows = flatten(&s, marks.as_deref(), &|_, _| true);
+        let conns: Vec<_> = rows
+            .iter()
+            .filter(|r| s.nodes[r.node].is_conn())
+            .map(|r| &s.nodes[r.node].name)
+            .collect();
+        assert_eq!(conns, ["local", "staging"]);
+        assert!(!rows.iter().any(|r| s.nodes[r.node].path == "other/x"));
+        // Search doesn't match connection names themselves.
+        assert_eq!(Filter::compile("staging").visibility(&s).1, 0);
+    }
+
     #[test]
     fn history_and_truncation() {
         let mut s = Store::new(3, 4);
+        s.add_conn("c", "mqtt://x:1883", None, vec![]);
         for _ in 0..5 {
-            s.add("a/b", b"123456", 0, false, Props::default());
+            s.add(0, "a/b", b"123456", 0, false, Props::default());
         }
-        let n = &s.nodes[s.nodes[s.nodes[ROOT].children["a"]].children["b"]];
+        let n = find(&s, 0, "a/b");
         let m = n.messages();
         assert_eq!(m.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![5, 4, 3]);
         assert_eq!(m[0].payload, b"1234");
@@ -508,9 +597,10 @@ mod tests {
     #[test]
     fn large_payload_keeps_only_prefix() {
         let mut s = Store::new(10, 4 * 1024);
+        s.add_conn("c", "mqtt://x:1883", None, vec![]);
         let big = vec![b'x'; 5 * 1024 * 1024];
-        s.add("cam/frame", &big, 0, false, Props::default());
-        let n = &s.nodes[s.nodes[s.nodes[ROOT].children["cam"]].children["frame"]];
+        s.add(0, "cam/frame", &big, 0, false, Props::default());
+        let n = find(&s, 0, "cam/frame");
         let m = n.latest().unwrap();
         assert_eq!(m.payload.len(), 4096);
         assert!(
@@ -534,6 +624,7 @@ mod tests {
     #[ignore]
     fn bench_filter() {
         let mut s = Store::new(10, 1024);
+        s.add_conn("c", "mqtt://x:1883", None, vec![]);
         let metrics = [
             "temp", "hum", "status", "rssi", "battery", "fw", "uptime", "load", "mem", "disk",
         ];
@@ -541,6 +632,7 @@ mod tests {
             for dev in 0..1000 {
                 for m in metrics {
                     s.add(
+                        0,
                         &format!("v1/site{site}/dev{dev}/{m}"),
                         b"42",
                         0,
