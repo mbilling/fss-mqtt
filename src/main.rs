@@ -507,9 +507,10 @@ mod tests {
     #[test]
     fn paths_saved_absolute() {
         let cwd = std::env::current_dir().unwrap();
+        // Compare as paths: Windows writes `\` where the input had `/`.
         assert_eq!(
-            absolute_path("secrets/ca.pem"),
-            cwd.join("secrets/ca.pem").to_string_lossy()
+            std::path::Path::new(&absolute_path("secrets/ca.pem")),
+            cwd.join("secrets").join("ca.pem")
         );
         let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap();
         assert!(absolute_path("~/ca.pem").starts_with(&home));
