@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::fmt::{self, human_bytes};
+use crate::pretty::{self, Format};
 use crate::store::Message;
 use crate::theme::Theme;
 use crate::ui::message_props;
@@ -24,10 +25,13 @@ pub struct Viewer {
     pub msgs: Vec<Arc<Message>>,
     pub idx: usize,
     pub mode: Mode,
-    pub is_json: bool,
+    pub format: Format,
     pub head: Vec<Line<'static>>,
     pub lines: Vec<Line<'static>>,
     pub scroll: usize,
+    /// Sideways offset for tables, which don't wrap.
+    pub hscroll: usize,
+    pub max_width: usize,
     width: usize,
 }
 
@@ -38,18 +42,23 @@ impl Viewer {
             msgs,
             idx,
             mode: Mode::Pretty,
-            is_json: false,
+            format: Format::Empty,
             head: vec![],
             lines: vec![],
             scroll: 0,
+            hscroll: 0,
+            max_width: 0,
             width: 0,
         }
     }
 
+    pub fn width_now(&self) -> usize {
+        self.width
+    }
+
     pub fn mode_name(&self) -> &'static str {
         match self.mode {
-            Mode::Pretty if self.is_json => "pretty",
-            Mode::Pretty => "text",
+            Mode::Pretty => self.format.label(),
             Mode::Raw => "raw",
             Mode::Hex => "hex",
         }
@@ -58,12 +67,7 @@ impl Viewer {
     pub fn relayout(&mut self, w: usize, th: &Theme) {
         self.width = w;
         let msg = self.msgs[self.idx].clone();
-        let pretty = if !msg.payload.is_empty() && !msg.truncated() {
-            fmt::json_pretty(&msg.payload)
-        } else {
-            None
-        };
-        self.is_json = pretty.is_some();
+        self.format = pretty::detect(&msg);
 
         self.head.clear();
         let mut meta = vec![
@@ -104,23 +108,25 @@ impl Viewer {
         self.head.push(Line::styled("─".repeat(w), th.border));
 
         let p = &msg.payload;
-        self.lines = if p.is_empty() {
-            vec![Line::styled("(empty payload)", th.dim.add_modifier(Modifier::ITALIC))]
-        } else if self.mode == Mode::Hex || !fmt::is_text(p) {
-            fmt::hex_lines(p, w, th)
-        } else if let (Mode::Pretty, Some(pretty)) = (self.mode, pretty) {
-            pretty
-                .lines()
-                .flat_map(|l| fmt::wrap(l, w))
-                .map(|l| fmt::highlight_json(&l, th))
-                .collect()
-        } else {
-            let text = String::from_utf8_lossy(p).replace("\r\n", "\n");
-            text.split('\n')
-                .flat_map(|l| fmt::wrap(&fmt::one_line(l.as_bytes(), l.len()), w))
-                .map(|l| Line::styled(l, th.text))
-                .collect()
+        let lines = match self.mode {
+            Mode::Pretty => pretty::render(&msg, th, w),
+            Mode::Hex => fmt::hex_lines(p, w, th),
+            Mode::Raw if p.is_empty() => vec![Line::styled("(empty payload)", th.dim.add_modifier(Modifier::ITALIC))],
+            Mode::Raw if !fmt::is_text(p) => fmt::hex_lines(p, w, th),
+            Mode::Raw => String::from_utf8_lossy(p)
+                .replace("\r\n", "\n")
+                .split('\n')
+                .map(|l| Line::styled(fmt::one_line(l.as_bytes(), l.len()), th.text))
+                .collect(),
         };
+        self.hscroll = 0;
+        if self.mode == Mode::Pretty && !pretty::wraps(self.format) {
+            self.max_width = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+            self.lines = lines;
+        } else {
+            self.max_width = w;
+            self.lines = lines.into_iter().flat_map(|l| pretty::wrap_line(l, w)).collect();
+        }
     }
 
     /// Handles a key; returns true when the viewer should close.
@@ -135,6 +141,11 @@ impl Viewer {
             KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => self.scroll += page,
             KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.scroll = self.lines.len(),
+            // Pan wide tables.
+            KeyCode::Left if k.modifiers.contains(KeyModifiers::SHIFT) => self.hscroll = self.hscroll.saturating_sub(8),
+            KeyCode::Char('<') => self.hscroll = self.hscroll.saturating_sub(8),
+            KeyCode::Right if k.modifiers.contains(KeyModifiers::SHIFT) => self.hscroll += 8,
+            KeyCode::Char('>') => self.hscroll += 8,
             KeyCode::Left | KeyCode::Char('h') if self.idx + 1 < self.msgs.len() => {
                 self.idx += 1;
                 relayout = true;
@@ -158,6 +169,7 @@ impl Viewer {
             self.relayout(self.width, th);
         }
         self.scroll = self.scroll.min(self.lines.len().saturating_sub(body_h));
+        self.hscroll = self.hscroll.min(self.max_width.saturating_sub(self.width));
         false
     }
 }

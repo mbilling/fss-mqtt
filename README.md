@@ -94,7 +94,6 @@ connection, or turns a subscription on or off (subscribed and unsubscribed live)
 | `--history` | `10` | messages kept per topic |
 | `--max-payload` | `4KiB` | payload bytes kept per message; the rest is discarded on arrival |
 | `--inline` | `64` | payloads up to this size are shown inline in the tree; larger ones show only their size |
-| `--preview` | `50` | payload bytes shown in the detail pane |
 | `-q, --qos` | `0` | subscription QoS |
 | `--cafile` | | PEM file of CA certificates to trust (implies TLS) |
 | `--cert`, `--key` | | client certificate and key for mutual TLS |
@@ -124,12 +123,13 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree | `→` | expand; on a topic with messages, enter its message list |
 | tree | `←` | collapse, or jump to parent |
 | tree | `⏎` | open the latest message full screen |
-| messages | `↑ ↓` | pick one of the last 10 messages (properties and preview follow) |
+| messages | `↑ ↓` | pick one of the last 10 messages (properties and payload follow) |
 | messages | `⏎` | open it full screen |
 | messages | `← esc` | back to the tree |
 | full screen | `↑ ↓ pgup pgdn` | scroll |
 | full screen | `← →` | older / newer message |
-| full screen | `tab` | cycle pretty JSON / raw / hex |
+| full screen | `shift ←→` `<` `>` | pan wide tables (CSV, Parquet) |
+| full screen | `tab` | cycle formatted / raw / hex |
 | full screen | `esc q ⏎` | close |
 | anywhere | `ctrl+c` | quit |
 
@@ -139,6 +139,26 @@ Colours follow `$COLORFGBG` for light terminals (e.g. `export COLORFGBG='0;15'`)
 Terminals without 24-bit colour (Apple Terminal, for one) get the nearest colours from the
 256-colour palette instead; 24-bit colour is used when `COLORTERM=truecolor` is set, in iTerm2,
 WezTerm, VS Code, Ghostty and on Windows. `FSS_MQTT_COLOR=truecolor` or `=256` overrides the guess.
+
+## Payload formats
+
+The payload is shown formatted, in the details pane (as much as fits) and full screen (`⏎`). The
+format comes from the `content-type` property when there is one, otherwise from the payload itself:
+
+| Format | Shown as |
+|---|---|
+| JSON, JSON lines | indented and coloured; a cut-off document is formatted as far as it goes |
+| XML | indented, short elements on one line, tags/attributes/values coloured |
+| CSV, TSV (`,` `;` tab `|`) | an aligned table, numbers right-aligned |
+| Parquet | row count, row groups, writer and file metadata; the schema with types, null counts and min/max; the first rows as a table |
+| MessagePack, CBOR (by `content-type`) | decoded and shown as JSON |
+| other text / binary | text / hex dump |
+
+Parquet, MessagePack and CBOR are decoded when the message arrives, while the whole payload is
+still there; what's kept is the decoded result (about 4 KiB of rows for Parquet) next to the first
+`--max-payload` bytes. Parquet support covers flat columns with PLAIN and dictionary encodings and
+Snappy, Gzip, Zstd and LZ4 compression; nested columns and rarer encodings show the schema with a
+note.
 
 ## Performance notes
 

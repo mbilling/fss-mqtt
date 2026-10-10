@@ -381,7 +381,13 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
                     let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
                         return End::Failed("malformed PUBLISH".into());
                     };
-                    store.lock().unwrap().add(cfg.conn, &topic, payload, qos, retain, props);
+                    // Decode binary formats now, while the whole payload is here
+                    // (and outside the lock).
+                    let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
+                    store
+                        .lock()
+                        .unwrap()
+                        .add_decoded(cfg.conn, &topic, payload, qos, retain, props, decoded);
                     match qos {
                         1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
                         2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),

@@ -28,6 +28,8 @@ pub struct Message {
     pub qos: u8,
     pub retain: bool,
     pub props: Props,
+    /// Binary formats decoded on arrival (Parquet, MessagePack, CBOR).
+    pub decoded: Option<Box<crate::pretty::Decoded>>,
 }
 
 impl Message {
@@ -180,7 +182,22 @@ impl Store {
         self.nodes[ROOT].topics
     }
 
+    #[cfg(test)]
     pub fn add(&mut self, conn: usize, topic: &str, payload: &[u8], qos: u8, retain: bool, props: Props) {
+        self.add_decoded(conn, topic, payload, qos, retain, props, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_decoded(
+        &mut self,
+        conn: usize,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        props: Props,
+        decoded: Option<crate::pretty::Decoded>,
+    ) {
         let keep = payload.len().min(self.max_payload);
         self.seq += 1;
         let now = SystemTime::now();
@@ -192,6 +209,7 @@ impl Store {
             qos,
             retain,
             props,
+            decoded: decoded.map(Box::new),
         });
 
         let mut n = self.conns[conn].node;

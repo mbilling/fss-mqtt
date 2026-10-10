@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use crate::app::{App, Focus, PanelRow, msg_index, node_title};
 use crate::fmt::{self, ago, commas, human_bytes, human_count, msg_count, plural};
 use crate::glyph;
+use crate::pretty;
 use crate::store::{ConnInfo, ConnState, FilterMode, MATCHED, Message, Row, Store};
 use crate::theme::Theme;
 
@@ -424,7 +425,7 @@ fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
     let (mut lines, sel) = if node.is_conn() {
         (conn_detail(app, st, n, iw), None)
     } else if node.has_messages() {
-        topic_detail(app, st, n, iw)
+        topic_detail(app, st, n, iw, ih)
     } else {
         (branch_detail(app, st, n, iw), None)
     };
@@ -434,7 +435,7 @@ fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store) {
 }
 
 /// The topic's details, and which line is the selected message.
-fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> (Vec<Line<'a>>, Option<usize>) {
+fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec<Line<'a>>, Option<usize>) {
     let th = &app.th;
     let node = &st.nodes[n];
     let msgs = node.messages();
@@ -518,33 +519,29 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> (Vec<Line<'a>>
         out.push(Line::default());
     }
 
-    // Payload preview
-    let shown = &cur.payload[..cur.payload.len().min(app.opts.preview_bytes)];
-    let mut ph = vec![
+    // Payload, formatted, in whatever room is left.
+    let format = pretty::detect(cur);
+    out.push(Line::from(vec![
         Span::styled("Payload ", th.section),
-        Span::styled(format!("· {}", human_bytes(cur.size)), th.dim),
-    ];
-    if shown.len() < cur.size {
-        ph.push(Span::styled(format!(" · first {} B", shown.len()), th.dim));
-    }
-    out.push(Line::from(ph));
-    if cur.size == 0 {
-        out.push(Line::styled("  (empty)", th.dim.add_modifier(Modifier::ITALIC)));
-    } else if fmt::is_text(shown) {
-        for l in fmt::wrap(&fmt::one_line(shown, shown.len()), w.saturating_sub(2)) {
-            out.push(Line::from(vec![Span::raw("  "), Span::styled(l, th.value)]));
-        }
+        Span::styled(format!("· {} · {}", format.label(), human_bytes(cur.size)), th.dim),
+    ]));
+    let indent = |mut l: Line<'a>| {
+        l.spans.insert(0, Span::raw("  "));
+        l
+    };
+    let body = pretty::render(cur, th, w.saturating_sub(2));
+    let room = h.saturating_sub(out.len());
+    if body.len() <= room {
+        out.extend(body.into_iter().map(indent));
     } else {
-        for mut l in fmt::hex_lines(shown, w.saturating_sub(2), th) {
-            l.spans.insert(0, Span::raw("  "));
-            out.push(l);
-        }
+        let show = room.saturating_sub(1);
+        let more = body.len() - show;
+        out.extend(body.into_iter().take(show).map(indent));
+        out.push(Line::styled(
+            format!("  … {more} more lines · {} to view all", glyph::ENTER),
+            th.faint,
+        ));
     }
-    out.push(Line::default());
-    out.push(Line::styled(
-        format!("  {} to view the full message", glyph::ENTER),
-        th.faint,
-    ));
     (out, Some(sel_line))
 }
 
@@ -774,19 +771,23 @@ fn viewer(buf: &mut Buffer, area: Rect, app: &App) {
     let body_h = app.viewer_body_h();
     let mut lines = v.head.clone();
     let end = (v.scroll + body_h).min(v.lines.len());
-    lines.extend(v.lines[v.scroll.min(end)..end].iter().cloned());
+    lines.extend(v.lines[v.scroll.min(end)..end].iter().map(|l| {
+        if v.hscroll > 0 {
+            crate::pretty::skip_cells(l, v.hscroll)
+        } else {
+            l.clone()
+        }
+    }));
     let r = Rect::new(0, 0, area.width, area.height - 1);
     draw_box(buf, r, &v.path, lines, true, None, th);
 
-    let mut h = hint(
-        th,
-        &[
-            ("↑↓ pgup pgdn", "scroll"),
-            ("←→", "older/newer"),
-            ("tab", &format!("view: {}", v.mode_name())),
-            ("esc", "back"),
-        ],
-    );
+    let mode = format!("view: {}", v.mode_name());
+    let mut keys = vec![("↑↓ pgup pgdn", "scroll"), ("←→", "older/newer")];
+    if v.max_width > v.width_now() {
+        keys.push(("shift ←→", "pan"));
+    }
+    keys.extend([("tab", mode.as_str()), ("esc", "back")]);
+    let mut h = hint(th, &keys);
     if v.lines.len() > body_h {
         h.spans.push(Span::styled(
             format!("  {}–{} of {} lines", v.scroll + 1, end, v.lines.len()),
@@ -870,6 +871,41 @@ mod tests {
             Props::default(),
         );
         st.add(staging, "devices/d9/up/temp", b"19.0", 0, false, Props::default());
+        let ct = |c: &str| Props {
+            content_type: Some(c.into()),
+            ..Default::default()
+        };
+        st.add(
+            local,
+            "v2/scada/online/data",
+            br#"<?xml version="1.0"?><DataStatus><StationStatus><StationData><Station id="91" kind="grid"><CommunicationId>91</CommunicationId><Name>gridStation</Name><Power unit="kW">1234.5</Power></Station></StationData></StationStatus></DataStatus>"#,
+            0,
+            false,
+            ct("application/xml"),
+        );
+        st.add(
+            local,
+            "v2/report/daily",
+            b"turbine;energy_kwh;availability;status\nT01;28450.5;99.2;RUNNING\nT02;27110;98.7;RUNNING\nT03;0;0;IDLE\n",
+            0,
+            false,
+            Props::default(),
+        );
+        let pq = std::fs::read(format!(
+            "{}/tests/fixtures/turbine-snappy.parquet",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let decoded = crate::pretty::decode_on_arrival(Some("application/parquet"), &pq);
+        st.add_decoded(
+            local,
+            "v2/turbine/T01/fastlog",
+            &pq,
+            0,
+            false,
+            ct("application/parquet"),
+            decoded,
+        );
 
         let mut rxs = Vec::new();
         let mut ctls = Vec::new();
@@ -892,10 +928,7 @@ mod tests {
                 password: None,
             });
         }
-        let opts = Options {
-            preview_bytes: 50,
-            inline_bytes: 64,
-        };
+        let opts = Options { inline_bytes: 64 };
         let mut app = App::new(
             Arc::new(Mutex::new(st)),
             opts,
@@ -1013,6 +1046,14 @@ mod tests {
             std::fs::write(dir.join(format!("{mode}-1-tree.html")), html(&app, light)).unwrap();
             press(&mut app, &[KeyCode::Right, KeyCode::Down]);
             std::fs::write(dir.join(format!("{mode}-2-messages.html")), html(&app, light)).unwrap();
+            for (i, filter) in ["v2/scada/online/data", "daily", "fastlog"].iter().enumerate() {
+                press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
+                typ(&mut app, filter);
+                let name = filter.replace('/', "-");
+                std::fs::write(dir.join(format!("{mode}-4{i}-{name}.html")), html(&app, light)).unwrap();
+                press(&mut app, &[KeyCode::Enter]);
+                std::fs::write(dir.join(format!("{mode}-5{i}-{name}-full.html")), html(&app, light)).unwrap();
+            }
             press(&mut app, &[KeyCode::Esc, KeyCode::Esc, KeyCode::BackTab, KeyCode::Down]);
             assert!(app.focus == crate::app::Focus::Conns);
             std::fs::write(dir.join(format!("{mode}-3-connections.html")), html(&app, light)).unwrap();
@@ -1079,6 +1120,20 @@ mod tests {
         let v = frame(&app, "pattern across brokers");
         assert!(v.contains("staging") && v.contains("d9") && !v.contains("plant"));
         press(&mut app, &[KeyCode::Esc]);
+
+        // Parquet in the viewer: the row table stays on one line per row and pans sideways.
+        typ(&mut app, "fastlog");
+        press(&mut app, &[KeyCode::Enter]);
+        let v = frame(&app, "parquet viewer");
+        assert!(v.contains("view: Parquet") && v.contains("shift ←→ pan"));
+        assert!(v.contains("TIMESTAMP(ms, UTC)") && v.contains("Rows · first"));
+        assert!(
+            !v.lines().any(|l| l.trim_start_matches(['│', ' ']).starts_with("10-08")),
+            "row table wrapped"
+        );
+        press(&mut app, &[KeyCode::Char('>')]);
+        assert_eq!(app.viewer.as_ref().unwrap().hscroll, 8);
+        press(&mut app, &[KeyCode::Esc, KeyCode::Esc]);
 
         typ(&mut app, "truck");
         press(&mut app, &[KeyCode::Down, KeyCode::Down]);

@@ -5,6 +5,8 @@ mod config;
 mod fmt;
 mod glyph;
 mod mqtt;
+mod parquet;
+mod pretty;
 mod store;
 mod theme;
 mod ui;
@@ -49,7 +51,6 @@ Connection flags:
       --key string           client private key PEM for mutual TLS
       --max-payload string   payload bytes kept per message; the rest is discarded on arrival (default \"4KiB\")
   -P, --password string      password
-      --preview int          payload bytes shown in the detail pane (default 50)
   -q, --qos int              subscription QoS (0, 1, 2)
   -t, --topic string         topic filter to subscribe to (repeatable) (default \"#\")
   -u, --username string      username
@@ -71,7 +72,6 @@ struct Args {
     qos: u8,
     history: usize,
     max_payload: usize,
-    preview: usize,
     inline: usize,
     insecure: bool,
     ca_file: Option<String>,
@@ -102,7 +102,6 @@ fn parse_args() -> Result<Option<Args>, String> {
         qos: 0,
         history: 10,
         max_payload: 4 * 1024,
-        preview: 50,
         inline: 64,
         insecure: false,
         ca_file: env("FSS_MQTT_CAFILE"),
@@ -154,7 +153,6 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--history" => a.history = num(&name, val()?)?,
             "--max-payload" => a.max_payload = parse_size(&val()?).map_err(|e| format!("--max-payload: {e}"))?,
-            "--preview" => a.preview = num(&name, val()?)?,
             "--inline" => a.inline = num(&name, val()?)?,
             "--insecure" => a.insecure = true,
             "--cafile" => a.ca_file = Some(val()?),
@@ -442,10 +440,7 @@ fn run() -> Result<(), String> {
         });
     }
 
-    let opts = app::Options {
-        preview_bytes: a.preview,
-        inline_bytes: a.inline,
-    };
+    let opts = app::Options { inline_bytes: a.inline };
     let mut app = app::App::new(store, opts, theme::Theme::detect(), ctls, path, ask);
     if let Some((text, err)) = notice {
         app.notify(text, err);

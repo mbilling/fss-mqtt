@@ -19,8 +19,7 @@ const AUTO_EXPAND_LIMIT: u32 = 300;
 const NOTICE_FOR: Duration = Duration::from_secs(6);
 
 pub struct Options {
-    pub preview_bytes: usize, // payload bytes shown in the detail pane
-    pub inline_bytes: usize,  // payloads up to this size are shown inline in the tree
+    pub inline_bytes: usize, // payloads up to this size are shown inline in the tree
 }
 
 /// The UI's handle on one connection (same index as `Store::conns`).
