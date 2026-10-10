@@ -530,7 +530,7 @@ fn csv_delimiter(t: &str) -> Option<u8> {
         return None;
     }
     let mut best = None;
-    for d in [b',', b';', b'\t', b'|'] {
+    for &d in b",;\t|" {
         let counts: Vec<usize> = lines.iter().map(|l| split_row(l, d).len() - 1).collect();
         if counts[0] >= 1 && counts.iter().all(|&c| c == counts[0]) && best.is_none_or(|(_, n)| counts[0] > n) {
             best = Some((d, counts[0]));
