@@ -246,6 +246,7 @@ enum End {
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut inbox = Inbox::default();
         let mut want = start;
         let mut halted = None;
         loop {
@@ -266,7 +267,9 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                 }
             }
             set_status(&store, cfg.conn, ConnState::Connecting, None);
-            match session(&cfg, &store, &rx) {
+            let end = session(&cfg, &store, &rx, &mut inbox);
+            crate::capture::flush(&store, cfg.conn); // what this session captured, to disk now
+            match end {
                 End::Stopped => want = false,
                 End::Halted(err) => {
                     halted = Some(err);
@@ -333,8 +336,43 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(last)
 }
 
+/// What happens to each message that arrives, with whatever state that needs
+/// across messages and reconnects (one per connection thread).
+#[derive(Default)]
+struct Inbox {}
+
+impl Inbox {
+    #[allow(clippy::too_many_arguments)]
+    fn receive(
+        &mut self,
+        store: &Mutex<Store>,
+        conn: usize,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        props: Props,
+    ) {
+        // Decode binary formats now, while the whole payload is here
+        // (and outside the lock).
+        let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
+        let captured = {
+            let mut st = store.lock().unwrap();
+            let target = st.capture_target(conn, topic);
+            let captured = target.map(|t| (t, props.clone()));
+            st.add_decoded(conn, topic, payload, qos, retain, props, decoded);
+            captured
+        };
+        // Encoded whole after the lock is released and queued for the
+        // connection's capture writer, which does the disk I/O.
+        if let Some((target, props)) = captured {
+            target.record(topic, payload, qos, retain, &props);
+        }
+    }
+}
+
 /// One connection's lifetime.
-fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
+fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox) -> End {
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
@@ -467,13 +505,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
                     let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
                         return End::Failed("malformed PUBLISH".into());
                     };
-                    // Decode binary formats now, while the whole payload is here
-                    // (and outside the lock).
-                    let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
-                    store
-                        .lock()
-                        .unwrap()
-                        .add_decoded(cfg.conn, &topic, payload, qos, retain, props, decoded);
+                    inbox.receive(store, cfg.conn, &topic, payload, qos, retain, props);
                     match qos {
                         1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
                         2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),
@@ -1010,6 +1042,71 @@ mod e2e {
         assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
         publish(&["-p", "18830", "-q", "1", "-t", "e2e/reconfigured", "-m", "x"]);
         assert_eq!(wait_for(&st, before + 3), before + 3, "after reconfigure");
+
+        // Capture to disk: matching messages go to a JSON Lines file whole,
+        // even past max_payload (64 KiB here); other topics don't.
+        let dir = std::env::temp_dir().join(format!("fss-mqtt-e2e-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let mut s = st.lock().unwrap();
+            s.capture_dir = dir.clone();
+            s.conns[0].capture.set_rules(&["e2e/cap/#".into()], &[]);
+        }
+        let big = "x".repeat(100 * 1024);
+        let bin: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let bin_path = dir.with_extension("bin");
+        std::fs::write(&bin_path, &bin).unwrap();
+        let base = st.lock().unwrap().total();
+        publish(&["-p", "18830", "-q", "1", "-t", "e2e/cap/big", "-m", &big]);
+        #[rustfmt::skip]
+        publish(&[
+            "-p", "18830", "-V", "mqttv5", "-q", "1", "-t", "e2e/cap/bin", "-f", &bin_path.to_string_lossy(),
+            "-D", "publish", "user-property", "k", "v",
+        ]);
+        publish(&["-p", "18830", "-q", "1", "-t", "e2e/elsewhere", "-m", "not captured"]);
+        assert_eq!(wait_for(&st, base + 3), base + 3, "capture run");
+        let kept = latest(&st, "e2e/cap/big").unwrap();
+        assert_eq!(
+            (kept.payload.len(), kept.size),
+            (64 * 1024, big.len()),
+            "the store keeps 64 KiB"
+        );
+        // Counted once written by the writer thread; then have it flush now
+        // rather than within the second (without holding the store lock).
+        let start = Instant::now();
+        while st.lock().unwrap().conns[0].capture.rules[0].written() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "not written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let writer = st.lock().unwrap().conns[0].capture.writer().expect("captured");
+        assert!(writer.flush_wait(Duration::from_secs(5)));
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("fss-mqtt-t-") && name.ends_with(".jsonl"), "{name}");
+        assert_eq!(st.lock().unwrap().conns[0].capture.file().as_ref(), Some(&files[0]));
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "only e2e/cap/#");
+        assert!(
+            lines[0].contains("\"topic\":\"e2e/cap/big\",\"qos\":1"),
+            "{}",
+            &lines[0][..80]
+        );
+        assert!(
+            lines[0].ends_with(&format!("\"size\":{},\"payload\":\"{big}\"}}", big.len())),
+            "whole"
+        );
+        assert!(lines[1].contains("\"topic\":\"e2e/cap/bin\"") && lines[1].contains("\"user\":[[\"k\",\"v\"]]"));
+        let b64 = crate::base64::encode(&bin);
+        assert!(
+            lines[1].ends_with(&format!("\"size\":1000,\"payload_base64\":\"{b64}\"}}")),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(st.lock().unwrap().conns[0].capture.rules[0].written(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&bin_path);
 
         // TLS with the test CA connects and receives; without it the cert is refused.
         let ca = std::env::var("FSS_TEST_CA").expect("set FSS_TEST_CA");

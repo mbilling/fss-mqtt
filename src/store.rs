@@ -6,8 +6,11 @@
 //! include the connection name.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use crate::capture::{Capture, Target};
 
 #[derive(Default, Clone)]
 pub struct Props {
@@ -132,6 +135,8 @@ pub struct ConnInfo {
     /// Gone from the connections file. Kept so indices stay valid; its
     /// topics are detached from the tree and it takes no more messages.
     pub removed: bool,
+    /// What of this connection is written to disk (opt-in, per topic).
+    pub capture: Capture,
 }
 
 pub struct Store {
@@ -141,6 +146,11 @@ pub struct Store {
     max_payload: usize,
     seq: u64,
     pub struct_ver: u64,
+    /// Messages for the status line from the connection threads (a publish
+    /// acknowledged, a capture file that failed), shown on the next tick.
+    notices: Vec<(String, bool)>,
+    /// Where capture files go (`--capture-dir`, the current directory by default).
+    pub capture_dir: PathBuf,
 }
 
 impl Store {
@@ -152,7 +162,24 @@ impl Store {
             max_payload,
             seq: 0,
             struct_ver: 0,
+            notices: Vec::new(),
+            capture_dir: PathBuf::from("."),
         }
+    }
+
+    /// Queues a status-line message (`error` shows it in red).
+    #[allow(dead_code)] // until a connection thread reports something
+    pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notices.push((text.into(), error));
+    }
+
+    /// The queued messages, and those of the capture writers.
+    pub fn take_notices(&mut self) -> Vec<(String, bool)> {
+        let mut out = std::mem::take(&mut self.notices);
+        for c in &self.conns {
+            out.extend(c.capture.take_notices());
+        }
+        out
     }
 
     /// Registers a connection and its top-level node; returns its index.
@@ -175,8 +202,20 @@ impl Store {
             },
             subs,
             removed: false,
+            capture: Capture::default(),
         });
         idx
+    }
+
+    /// Where to write a message arriving on `topic`, if it is captured; see
+    /// [`Capture::target`].
+    pub fn capture_target(&mut self, conn: usize, topic: &str) -> Option<Target> {
+        let dir = &self.capture_dir;
+        let c = &mut self.conns[conn];
+        if c.removed {
+            return None;
+        }
+        c.capture.target(dir, &c.name, topic)
     }
 
     /// The connections still in use (not removed).
