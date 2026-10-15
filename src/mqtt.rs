@@ -246,6 +246,7 @@ enum End {
 pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<Cmd> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let mut inbox = Inbox::default();
         let mut want = start;
         let mut halted = None;
         loop {
@@ -266,7 +267,7 @@ pub fn spawn(mut cfg: Config, store: Arc<Mutex<Store>>, start: bool) -> Sender<C
                 }
             }
             set_status(&store, cfg.conn, ConnState::Connecting, None);
-            match session(&cfg, &store, &rx) {
+            match session(&cfg, &store, &rx, &mut inbox) {
                 End::Stopped => want = false,
                 End::Halted(err) => {
                     halted = Some(err);
@@ -333,8 +334,42 @@ fn dial(host: &str, port: u16) -> Result<TcpStream, String> {
     Err(last)
 }
 
+/// What happens to each message that arrives, with whatever state that needs
+/// across messages and reconnects (one per connection thread).
+#[derive(Default)]
+struct Inbox {
+    /// Sparkplug B metric names by alias, from the births seen.
+    sparkplug: crate::sparkplug::Aliases,
+}
+
+impl Inbox {
+    #[allow(clippy::too_many_arguments)]
+    fn receive(
+        &mut self,
+        store: &Mutex<Store>,
+        conn: usize,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        props: Props,
+    ) {
+        // Decode binary formats now, while the whole payload is here
+        // (and outside the lock). Sparkplug B is told by its topic, and needs
+        // the names its births gave the aliases.
+        let decoded = match self.sparkplug.decode(topic, payload) {
+            Some(v) => Some(v),
+            None => crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload),
+        };
+        store
+            .lock()
+            .unwrap()
+            .add_decoded(conn, topic, payload, qos, retain, props, decoded);
+    }
+}
+
 /// One connection's lifetime.
-fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
+fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>, inbox: &mut Inbox) -> End {
     let tls = match tls_config(cfg) {
         Ok(t) => t,
         Err(e @ TlsError::Key(..)) => return End::Halted(e.to_string()),
@@ -467,13 +502,7 @@ fn session(cfg: &Config, store: &Mutex<Store>, rx: &Receiver<Cmd>) -> End {
                     let Some((topic, pid, props, payload)) = parse_publish(&body, qos) else {
                         return End::Failed("malformed PUBLISH".into());
                     };
-                    // Decode binary formats now, while the whole payload is here
-                    // (and outside the lock).
-                    let decoded = crate::pretty::decode_on_arrival(props.content_type.as_deref(), payload);
-                    store
-                        .lock()
-                        .unwrap()
-                        .add_decoded(cfg.conn, &topic, payload, qos, retain, props, decoded);
+                    inbox.receive(store, cfg.conn, &topic, payload, qos, retain, props);
                     match qos {
                         1 => reply = Some([0x40, 2, (pid >> 8) as u8, pid as u8]),
                         2 => reply = Some([0x50, 2, (pid >> 8) as u8, pid as u8]),
@@ -841,6 +870,44 @@ mod tests {
         assert_eq!(rd.next(&mut src).unwrap().unwrap().0, 0x30);
         assert_eq!(rd.next(&mut src).unwrap().unwrap().0, 0xD0);
     }
+
+    #[test]
+    fn inbox_decodes_sparkplug_with_its_births() {
+        let fixture =
+            |n: &str| std::fs::read(format!("{}/tests/fixtures/sparkplug/{n}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let store = Mutex::new(Store::new(10, 64));
+        let conn = store.lock().unwrap().add_conn("t", "test", None, vec![]);
+        let mut inbox = Inbox::default();
+        for (topic, file) in [
+            ("spBv1.0/Plant1/NBIRTH/Gateway1", "nbirth.bin"),
+            ("spBv1.0/Plant1/NDATA/Gateway1", "ndata.bin"),
+        ] {
+            inbox.receive(&store, conn, topic, &fixture(file), 0, false, Props::default());
+        }
+        // Not Sparkplug: the generic decoders, by content type.
+        let json = Props {
+            content_type: Some("application/json".into()),
+            ..Props::default()
+        };
+        inbox.receive(&store, conn, "spBv1.0/STATE/scada", b"{\"online\":true}", 1, true, json);
+
+        let st = store.lock().unwrap();
+        let latest = |path: &str| {
+            st.nodes
+                .iter()
+                .find(|n| n.path == path)
+                .and_then(|n| n.latest().cloned())
+                .unwrap()
+        };
+        let data = latest("spBv1.0/Plant1/NDATA/Gateway1");
+        let view = data.decoded.as_deref().expect("decoded on arrival");
+        assert_eq!(view.format, "Sparkplug B");
+        let crate::view::Body::Table { rows, .. } = &view.sections[0].body else {
+            panic!("no metrics table")
+        };
+        assert_eq!(rows[0][0].as_deref(), Some("Inputs/Int8"), "named from the birth");
+        assert!(latest("spBv1.0/STATE/scada").decoded.is_none());
+    }
 }
 
 /// Needs mosquitto on 127.0.0.1:18830 (plain) and localhost:18883 (TLS, with
@@ -1089,5 +1156,29 @@ mod e2e {
             "-t", "e2e/mtls", "-m", "hi",
         ]);
         assert_eq!(wait_for(&st, 1), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn e2e_sparkplug() {
+        // A birth, then data over the wire: the connection's thread names the aliases.
+        let (st, mut cfg) = setup(18830, false, None, &["spBv1.0/#"]);
+        cfg.client_id = "e2e-sparkplug".into();
+        let _tx = spawn(cfg, st.clone(), true);
+        assert_eq!(wait_state(&st, ConnState::Connected).state, ConnState::Connected);
+        let dir = format!("{}/tests/fixtures/sparkplug", env!("CARGO_MANIFEST_DIR"));
+        for (kind, file) in [("NBIRTH", "nbirth.bin"), ("NDATA", "ndata.bin")] {
+            let topic = format!("spBv1.0/E2E/{kind}/Gateway1");
+            publish(&["-p", "18830", "-q", "1", "-t", &topic, "-f", &format!("{dir}/{file}")]);
+        }
+        assert_eq!(wait_for(&st, 2), 2);
+        let m = latest(&st, "spBv1.0/E2E/NDATA/Gateway1").expect("data stored");
+        let view = m.decoded.as_deref().expect("decoded on arrival");
+        assert_eq!(view.format, "Sparkplug B");
+        let crate::view::Body::Table { rows, .. } = &view.sections[0].body else {
+            panic!("no metrics table")
+        };
+        assert_eq!(rows[0][0].as_deref(), Some("Inputs/Int8"), "named from the birth");
+        assert_eq!(rows[0][3].as_deref(), Some("-24"));
     }
 }

@@ -1199,6 +1199,44 @@ mod tests {
     }
 
     #[test]
+    fn sparkplug_metrics_in_the_details_pane() {
+        let (mut app, _rx) = sample(tmp_config("sparkplug"));
+        let fixture =
+            |n: &str| std::fs::read(format!("{}/tests/fixtures/sparkplug/{n}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        {
+            // As a connection's thread decodes them: the birth names the aliases.
+            let mut aliases = crate::sparkplug::Aliases::default();
+            let mut st = app.store.lock().unwrap();
+            for (topic, file) in [
+                ("spBv1.0/Plant1/NBIRTH/Gateway1", "nbirth.bin"),
+                ("spBv1.0/Plant1/NDATA/Gateway1", "ndata.bin"),
+            ] {
+                let p = fixture(file);
+                let decoded = aliases.decode(topic, &p);
+                st.add_decoded(0, topic, &p, 0, false, Props::default(), decoded);
+            }
+        }
+        app.tick();
+        typ(&mut app, "NDATA");
+        press(&mut app, &[KeyCode::Down]);
+        let v = frame(&app, "sparkplug data");
+        for want in [
+            "Sparkplug B",
+            "NDATA node data · 6 metrics",
+            "Inputs/Int8",
+            "-24",
+            "Inputs/Float",
+        ] {
+            assert!(v.contains(want), "{want:?} missing:\n{v}");
+        }
+        press(&mut app, &[KeyCode::Enter]);
+        let v = frame(&app, "sparkplug data, full screen");
+        for want in ["Metrics", "Inputs/String", "world", "historical", "alias 99", "NBIRTH"] {
+            assert!(v.contains(want), "{want:?} missing:\n{v}");
+        }
+    }
+
+    #[test]
     fn odd_characters_stay_in_their_cells() {
         let cfg = tmp_config("odd");
         let (mut app, _rx) = sample(cfg.clone());
@@ -1373,6 +1411,30 @@ mod tests {
             Ok(Cmd::Reconfigure { cfg, .. }) if cfg.host == "staging2" && cfg.password.is_none()
         ));
         let _ = std::fs::remove_file(&cfg);
+    }
+
+    #[test]
+    fn focus_helpers_and_thread_notices() {
+        let (mut app, _rx) = sample(tmp_config("focus"));
+        typ(&mut app, "v1/plant/line1");
+        press(&mut app, &[KeyCode::Down]);
+        let (n, latest) = app.focused_message().expect("latest message of the selected topic");
+        assert_eq!(app.focused_node(), Some(n));
+        assert_eq!(app.store.lock().unwrap().nodes[n].latest().unwrap().seq, latest.seq);
+        // In the message list: the picked one; full screen: the shown one.
+        press(&mut app, &[KeyCode::Right, KeyCode::Down]);
+        let (_, picked) = app.focused_message().unwrap();
+        assert!(picked.seq < latest.seq);
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(app.focused_message().map(|(_, m)| m.seq), Some(picked.seq));
+        assert_eq!(app.focused_node(), Some(n));
+
+        // Notices from connection threads show on the next tick; an error
+        // isn't hidden by a later success.
+        app.store.lock().unwrap().notify("capture failed", true);
+        app.store.lock().unwrap().notify("published", false);
+        app.tick();
+        assert!(matches!(&app.notice, Some((t, true, _)) if t == "capture failed"));
     }
 
     #[test]

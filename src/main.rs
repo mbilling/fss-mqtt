@@ -3,6 +3,7 @@
 mod app;
 mod arrow;
 mod avro;
+mod base64;
 mod broker;
 mod changeset;
 mod compressed;
@@ -15,6 +16,7 @@ mod parquet;
 mod pemkey;
 mod pretty;
 mod protobuf;
+mod sparkplug;
 mod sqlite;
 mod store;
 mod theme;
