@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq)]
 pub struct Props {
     pub content_type: Option<String>,
     pub response_topic: Option<String>,
@@ -141,6 +141,9 @@ pub struct Store {
     max_payload: usize,
     seq: u64,
     pub struct_ver: u64,
+    /// Messages for the status line from the connection threads (a publish
+    /// acknowledged, a capture file that failed), shown on the next tick.
+    notices: Vec<(String, bool)>,
 }
 
 impl Store {
@@ -152,7 +155,17 @@ impl Store {
             max_payload,
             seq: 0,
             struct_ver: 0,
+            notices: Vec::new(),
         }
+    }
+
+    /// Queues a status-line message (`error` shows it in red).
+    pub fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notices.push((text.into(), error));
+    }
+
+    pub fn take_notices(&mut self) -> Vec<(String, bool)> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Registers a connection and its top-level node; returns its index.

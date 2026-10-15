@@ -3,8 +3,10 @@
 mod app;
 mod arrow;
 mod avro;
+mod base64;
 mod broker;
 mod changeset;
+mod composer;
 mod compressed;
 mod config;
 mod crc32;
