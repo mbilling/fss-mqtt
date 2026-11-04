@@ -19,6 +19,7 @@ mod config;
 mod crc32;
 #[cfg(any(target_arch = "wasm32", test))]
 mod demo;
+mod export;
 mod fmt;
 mod glyph;
 mod gzip;

@@ -746,6 +746,9 @@ impl App {
             k
         };
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && k.code == KeyCode::Char('x') {
+            return self.export_selected();
+        }
         if self.focus == Focus::Conns && self.panel_key(k) {
             return;
         }
@@ -1114,6 +1117,44 @@ impl App {
             Err(e) => self.notify(format!("{name}: {e}"), true),
         }
         Ok(())
+    }
+
+    /// `ctrl+x`: the selected branch's topics (a whole connection's, on its
+    /// row) exported as JSON and CSV (export.rs): files in the capture
+    /// directory, or in the web version, downloads.
+    fn export_selected(&mut self) {
+        let node = match (self.focus, self.panel.get(self.panel_cursor)) {
+            (Focus::Conns, Some(PanelRow::Conn(i) | PanelRow::Sub(i, _) | PanelRow::Capture(i, _))) => {
+                Some(self.store.lock().unwrap().conns[*i].node)
+            }
+            _ => self.selected,
+        };
+        let Some(n) = node else {
+            return self.notify("select a topic, a branch or a connection to export", false);
+        };
+        let e = crate::export::namespace(&self.store.lock().unwrap(), n, self.now);
+        if e.topics == 0 {
+            return self.notify("nothing to export there: no messages yet", false);
+        }
+        let what = plural_topics(e.topics);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dir = self.store.lock().unwrap().capture_dir.clone();
+            let (json, csv) = (
+                dir.join(format!("{}.json", e.name)),
+                dir.join(format!("{}.csv", e.name)),
+            );
+            match std::fs::write(&json, &e.json).and_then(|_| std::fs::write(&csv, &e.csv)) {
+                Ok(()) => self.notify(format!("exported {what} to {} and .csv", json.display()), false),
+                Err(err) => self.notify(format!("couldn't export to {}: {err}", dir.display()), true),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::web::download(&format!("{}.json", e.name), &e.json, "application/json");
+            crate::web::download(&format!("{}.csv", e.name), &e.csv, "text/csv");
+            self.notify(format!("exported {what}: {}.json and .csv, downloaded", e.name), false);
+        }
     }
 
     /// Writes connection `i`'s entry back to the connections file, if it
@@ -2037,6 +2078,10 @@ impl App {
             None => 0,
         }
     }
+}
+
+fn plural_topics(n: usize) -> String {
+    crate::fmt::plural(n, "topic", "topics")
 }
 
 /// "connection · topic/path" for a topic, or the connection name.

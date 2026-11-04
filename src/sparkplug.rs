@@ -186,6 +186,50 @@ pub fn is_topic(topic: &str) -> bool {
     parse_topic(topic).is_some()
 }
 
+/// What a Sparkplug B message says of its edge node or device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Life {
+    Born,
+    Dead,
+    Data,
+    Command,
+}
+
+/// Where a Sparkplug B message's edge node or device is in the namespace
+/// (`group/node` or `group/node/device`), and what it says of it.
+pub fn place(topic: &str) -> Option<(String, Life)> {
+    let t = parse_topic(topic)?;
+    let life = match t.kind {
+        Kind::NBirth | Kind::DBirth => Life::Born,
+        Kind::NDeath | Kind::DDeath => Life::Dead,
+        Kind::NData | Kind::DData => Life::Data,
+        Kind::NCmd | Kind::DCmd => Life::Command,
+    };
+    Some((t.key(), life))
+}
+
+/// The metrics a decoded message lists, by name with their values as text
+/// (as the Metrics table shows them).
+pub fn metrics(v: &DocView) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for s in v.sections.iter().filter(|s| s.title == "Metrics") {
+        let Body::Table { header, rows } = &s.body else {
+            continue;
+        };
+        let col = |name: &str| header.iter().position(|h| h == name);
+        let (Some(name), Some(value)) = (col("name"), col("value")) else {
+            continue;
+        };
+        for r in rows {
+            if let Some(Some(n)) = r.get(name) {
+                let v = r.get(value).cloned().flatten().unwrap_or_else(|| "null".into());
+                out.push((n.clone(), v));
+            }
+        }
+    }
+    out
+}
+
 /// `spBv1.0/{group}/{type}/{edge node}[/{device}]` with a message type whose
 /// payload is Sparkplug protobuf; `STATE` (JSON or text) and anything else is
 /// `None`.
