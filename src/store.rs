@@ -543,7 +543,7 @@ impl Store {
         props: Props,
         decoded: Option<crate::pretty::Decoded>,
     ) {
-        let _ = self.insert(
+        let n = self.insert(
             conn,
             topic,
             time,
@@ -554,6 +554,10 @@ impl Store {
             props,
             decoded,
         );
+        // Its Sparkplug B metrics laid out again, as they were then.
+        if let Some(n) = n {
+            self.sparkplug_namespace(conn, topic, n, time);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -649,12 +653,13 @@ impl Store {
     }
 
     /// Every message held, oldest first (by arrival), with its connection
-    /// and topic.
+    /// and topic; not the Sparkplug metrics laid out under `@sparkplug`,
+    /// which their messages give again.
     pub fn all_messages(&self) -> Vec<(usize, &str, &Arc<Message>)> {
         let mut all: Vec<_> = self
             .nodes
             .iter()
-            .filter(|n| !n.msgs.is_empty() && !self.conns[n.conn].removed)
+            .filter(|n| !n.msgs.is_empty() && !self.conns[n.conn].removed && !n.path.starts_with(SPARKPLUG))
             .flat_map(|n| n.msgs.iter().map(move |m| (n.conn, n.path.as_str(), m)))
             .collect();
         all.sort_by_key(|(_, _, m)| m.seq);

@@ -2285,8 +2285,21 @@ mod e2e {
             let topic = format!("spBv1.0/E2E/{kind}/Gateway1");
             publish(&["-p", "18830", "-q", "1", "-t", &topic, "-f", &format!("{dir}/{file}")]);
         }
-        assert_eq!(wait_for(&st, 2), 2);
+        // (The metrics are topics too, under @sparkplug: wait for the data itself.)
+        let start = Instant::now();
+        while latest(&st, "spBv1.0/E2E/NDATA/Gateway1").is_none() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let m = latest(&st, "spBv1.0/E2E/NDATA/Gateway1").expect("data stored");
+        // And laid out as the namespace: the node's state and its metrics, named.
+        assert_eq!(
+            latest(&st, "@sparkplug/E2E/Gateway1/@state").unwrap().payload,
+            b"online"
+        );
+        assert!(
+            latest(&st, "@sparkplug/E2E/Gateway1/Inputs/Int8").is_some(),
+            "a metric by name"
+        );
         let view = m.decoded.as_deref().expect("decoded on arrival");
         assert_eq!(view.format, "Sparkplug B");
         let crate::view::Body::Table { rows, .. } = &view.sections[0].body else {
@@ -2323,7 +2336,6 @@ mod e2e {
         assert_eq!(back.decoded.as_deref().map(|v| v.format), Some("Sparkplug B"));
         let _tx2 = spawn(cfg2, st2.clone(), true);
         assert_eq!(wait_state(&st2, ConnState::Connected).state, ConnState::Connected);
-        let before = st2.lock().unwrap().total();
         publish(&[
             "-p",
             "18830",
@@ -2334,8 +2346,15 @@ mod e2e {
             "-f",
             &format!("{dir}/ndata.bin"),
         ]);
-        assert_eq!(wait_for(&st2, before + 1), before + 1);
+        // A newer data message (its metrics come with it, under @sparkplug).
+        let start = Instant::now();
+        while latest(&st2, "spBv1.0/E2E/NDATA/Gateway1").is_some_and(|m| m.seq == back.seq)
+            && start.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let m = latest(&st2, "spBv1.0/E2E/NDATA/Gateway1").unwrap();
+        assert!(m.seq > back.seq, "new data arrived");
         let crate::view::Body::Table { rows, .. } = &m.decoded.as_deref().unwrap().sections[0].body else {
             panic!("no metrics table")
         };
