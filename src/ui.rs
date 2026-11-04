@@ -1099,7 +1099,7 @@ fn branch_values<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> Vec
         .map(|&i| {
             let t = &st.nodes[i];
             let tag = t.path[node.path.len()..].trim_start_matches('/').to_string();
-            let v = t.latest().map(|m| value_of(m)).unwrap_or_default();
+            let v = t.latest().map(|m| crate::export::reading(m)).unwrap_or_default();
             (i, tag, v)
         })
         .collect();
@@ -1156,74 +1156,6 @@ fn branch_values<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> Vec
         out.push(Line::styled(format!("  … {} more below", total - tags.len()), th.faint));
     }
     out
-}
-
-/// A topic's value as the values table shows it.
-#[derive(Default)]
-struct Value {
-    value: String,
-    /// A value of its own (not a summary of the payload): right-aligned.
-    plain: bool,
-    unit: Option<String>,
-    quality: Option<String>,
-}
-
-/// What a message says, in a word or two: a `{"value", "unit",
-/// "quality"}` object's (as a unified namespace's tags often are), a short
-/// text or number, the first numbers a JSON payload carries, or else what
-/// it is and its size.
-fn value_of(m: &crate::store::Message) -> Value {
-    let quality = m
-        .props
-        .user
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("quality"))
-        .map(|(_, v)| v.clone());
-    let text = |j: &crate::json::Json| match j {
-        crate::json::Json::Str(s) => Some(s.clone()),
-        crate::json::Json::Num(n) => Some(fmt::number(*n)),
-        crate::json::Json::Bool(b) => Some(b.to_string()),
-        _ => None,
-    };
-    if m.payload.len() == m.size
-        && let Ok(j @ crate::json::Json::Obj(_)) = crate::json::Json::parse(&m.payload, 8)
-    {
-        let first = |keys: &[&str]| keys.iter().find_map(|k| j.get(k)).and_then(text);
-        if let Some(value) = first(&["value", "val", "v"]) {
-            return Value {
-                value,
-                plain: true,
-                unit: first(&["unit", "units", "eng_unit", "engUnit", "uom"]),
-                quality: first(&["quality", "q"]).or(quality),
-            };
-        }
-        let nums = crate::chart::fields(m);
-        if !nums.is_empty() {
-            let shown: Vec<String> = nums
-                .iter()
-                .take(3)
-                .map(|(k, v)| format!("{k} {}", fmt::number(*v)))
-                .collect();
-            return Value {
-                value: shown.join(" · "),
-                quality,
-                ..Default::default()
-            };
-        }
-    }
-    if m.size <= 32 && fmt::is_text(&m.payload) {
-        return Value {
-            value: String::from_utf8_lossy(&m.payload).trim().to_string(),
-            plain: true,
-            quality,
-            ..Default::default()
-        };
-    }
-    Value {
-        value: format!("{} · {}", crate::pretty::detect(m).label(), human_bytes(m.size)),
-        quality,
-        ..Default::default()
-    }
 }
 
 /// "enterprise acme · site oslo · area packaging": the unified namespace
@@ -1437,6 +1369,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("e", "publish", 1),
             ("t y", "copy", 1),
             ("^r", "capture", 1),
+            ("^x", "export", 4),
             ("h esc", "back", 2),
             ("tab", "pane", 2),
         ],
@@ -1457,6 +1390,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("e", "publish", 1),
             ("t y", "copy", 1),
             ("^r", "capture", 1),
+            ("^x", "export", 4),
             ("esc", "clear filter", 2),
             ("tab", "pane", 2),
         ],
@@ -1474,6 +1408,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
             ("^r", "capture", 1),
+            ("^x", "export", 4),
             ("← esc", "back", 2),
             ("tab", "pane", 2),
         ],
@@ -1493,6 +1428,7 @@ fn hints<'a>(app: &App) -> Line<'a> {
             ("^e", "publish", 1),
             ("^t ^y", "copy", 1),
             ("^r", "capture", 1),
+            ("^x", "export", 4),
             ("esc", "clear filter", 2),
             ("tab", "pane", 2),
         ],
@@ -3420,6 +3356,33 @@ mod tests {
         typ(&mut app, " ");
         assert_eq!(sent(&rxs[0]), ["-v1/#"]);
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_exports_the_selected_branch() {
+        let (mut app, _rx) = sample(tmp_config("export"));
+        let dir = std::env::temp_dir().join(format!("fss-mqtt-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        app.store.lock().unwrap().capture_dir = dir.clone();
+        typ(&mut app, "v1/plant");
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        let (note, err, _) = app.notice.clone().unwrap();
+        assert!(
+            !err && note.starts_with("exported ") && note.ends_with(".json and .csv"),
+            "{note}"
+        );
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.starts_with("fss-mqtt-local-v1_plant-") && f.ends_with(".json")),
+            "{files:?}"
+        );
+        assert!(files.iter().any(|f| f.ends_with(".csv")), "{files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

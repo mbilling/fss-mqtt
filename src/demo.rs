@@ -101,6 +101,10 @@ pub struct Demo {
     conns: Vec<usize>,
     /// The unified namespace's connection.
     acme: usize,
+    /// The Sparkplug B connection.
+    plant: usize,
+    /// Sparkplug B sequence numbers, 0 to 255 per edge node.
+    seq: u64,
     step: u64,
     seed: u64,
 }
@@ -131,6 +135,8 @@ pub fn start(st: &mut Store) -> Demo {
     let mut d = Demo {
         conns: Vec::new(),
         acme: 0,
+        plant: 0,
+        seq: 0,
         step: 0,
         seed: 0x9e37_79b9_7f4a_7c15,
     };
@@ -159,6 +165,14 @@ pub fn start(st: &mut Store) -> Demo {
         let p = format!("{{\"value\":\"{state}\",\"quality\":\"Good\"}}");
         add(st, d.acme, topic, p.as_bytes(), true, Some("application/json"), &[]);
     }
+    let sub = Sub {
+        topic: "spBv1.0/#".into(),
+        enabled: true,
+        err: None,
+    };
+    d.plant = st.add_conn("plant", "mqtt://demo-sparkplug:1883", None, vec![sub]);
+    st.conns[d.plant].status.state = ConnState::Connected;
+    d.births(st, true);
     for (i, site) in SITES.iter().enumerate() {
         let c = d.conns[i];
         add(st, c, &format!("site/{site}/online"), b"true", true, None, &[]);
@@ -305,6 +319,93 @@ impl Demo {
             }
         }
         self.uns_second(st, cycle, &ts);
+        self.sparkplug_second(st, cycle);
+    }
+
+    /// A Sparkplug B message from plant's edge node gw1 (or one of its
+    /// devices).
+    fn spb(&mut self, st: &mut Store, kind: &str, device: Option<&str>, metrics: &[(Option<&str>, u64, Sp)]) {
+        let topic = match device {
+            Some(d) => format!("spBv1.0/plant/{kind}/gw1/{d}"),
+            None => format!("spBv1.0/plant/{kind}/gw1"),
+        };
+        let p = sparkplug_payload(self.seq % 256, metrics);
+        self.seq += 1;
+        add(st, self.plant, &topic, &p, false, None, &[]);
+    }
+
+    /// The edge node's birth (`node`), and its two devices'.
+    fn births(&mut self, st: &mut Store, node: bool) {
+        if node {
+            self.spb(
+                st,
+                "NBIRTH",
+                None,
+                &[
+                    (Some("bdSeq"), 0, Sp::Long(0)),
+                    (Some("Node Control/Rebirth"), 0, Sp::Bool(false)),
+                    (Some("Properties/Firmware"), 0, Sp::Str("2.4.1")),
+                ],
+            );
+            self.spb(
+                st,
+                "DBIRTH",
+                Some("press1"),
+                &[
+                    (Some("Hydraulics/Pressure"), 1, Sp::Double(182.0)),
+                    (Some("Hydraulics/Temperature"), 2, Sp::Double(41.5)),
+                    (Some("Cycle/Count"), 3, Sp::Long(1200)),
+                    (Some("Status"), 4, Sp::Str("running")),
+                ],
+            );
+        }
+        self.spb(
+            st,
+            "DBIRTH",
+            Some("oven2"),
+            &[
+                (Some("Zone1/Temperature"), 1, Sp::Float(180.0)),
+                (Some("Zone2/Temperature"), 2, Sp::Float(175.0)),
+                (Some("Door/Open"), 3, Sp::Bool(false)),
+            ],
+        );
+    }
+
+    /// A second of plant's Sparkplug B: the press's data every second, the
+    /// oven's every other, by alias as data is sent. Every two minutes the
+    /// oven dies at 80 s and is born again at 100 s.
+    fn sparkplug_second(&mut self, st: &mut Store, cycle: u64) {
+        let pressure = self.num(176.0, 190.0, 1).parse().unwrap_or(182.0);
+        let temp = self.num(40.0, 44.0, 1).parse().unwrap_or(41.5);
+        let count = 1200 + self.step * 2;
+        let mut press = vec![
+            (None, 1, Sp::Double(pressure)),
+            (None, 2, Sp::Double(temp)),
+            (None, 3, Sp::Long(count)),
+        ];
+        if cycle == 50 {
+            press.push((None, 4, Sp::Str("tool change")));
+        } else if cycle == 58 {
+            press.push((None, 4, Sp::Str("running")));
+        }
+        self.spb(st, "DDATA", Some("press1"), &press);
+        match cycle {
+            80 => self.spb(st, "DDEATH", Some("oven2"), &[]),
+            100 => self.births(st, false),
+            81..100 => {}
+            _ if cycle.is_multiple_of(2) => {
+                let z1 = self.num(178.0, 182.0, 1).parse().unwrap_or(180.0);
+                let z2 = self.num(173.0, 177.0, 1).parse().unwrap_or(175.0);
+                let door = Sp::Bool((60..64).contains(&cycle));
+                self.spb(
+                    st,
+                    "DDATA",
+                    Some("oven2"),
+                    &[(None, 1, Sp::Float(z1)), (None, 2, Sp::Float(z2)), (None, 3, door)],
+                );
+            }
+            _ => {}
+        }
     }
 
     /// One second of acme's tags, as `{"value", "unit", "quality", "ts"}`.
@@ -369,8 +470,95 @@ fn add(
         user: user.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         ..Default::default()
     };
-    let decoded = crate::pretty::decode_on_arrival(ct, payload);
+    // Sparkplug B is decoded with the names its births gave, as a
+    // connection decodes it.
+    let sparkplug = st.conns[conn].sparkplug.lock().unwrap().decode(topic, payload);
+    let decoded = sparkplug.or_else(|| crate::pretty::decode_on_arrival(ct, payload));
     st.add_decoded(conn, topic, payload, 0, retain, props, decoded);
+}
+
+/// A Sparkplug B metric's value, as the demo sends them.
+enum Sp<'a> {
+    Long(u64),
+    Float(f32),
+    Double(f64),
+    Bool(bool),
+    Str(&'a str),
+}
+
+/// A Sparkplug B payload (protobuf): a timestamp, the metrics (each named,
+/// or by alias only as data is sent), and the sequence number.
+fn sparkplug_payload(seq: u64, metrics: &[(Option<&str>, u64, Sp)]) -> Vec<u8> {
+    fn varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn key(out: &mut Vec<u8>, field: u64, wire: u64) {
+        varint(out, field << 3 | wire);
+    }
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut out = Vec::new();
+    key(&mut out, 1, 0);
+    varint(&mut out, ms);
+    for (name, alias, value) in metrics {
+        let mut m = Vec::new();
+        if let Some(n) = name {
+            key(&mut m, 1, 2);
+            varint(&mut m, n.len() as u64);
+            m.extend_from_slice(n.as_bytes());
+        }
+        if *alias > 0 {
+            key(&mut m, 2, 0);
+            varint(&mut m, *alias);
+        }
+        // Datatypes: Int64 4, Float 9, Double 10, Boolean 11, String 12.
+        let datatype = match value {
+            Sp::Long(_) => 4,
+            Sp::Float(_) => 9,
+            Sp::Double(_) => 10,
+            Sp::Bool(_) => 11,
+            Sp::Str(_) => 12,
+        };
+        if name.is_some() {
+            key(&mut m, 4, 0);
+            varint(&mut m, datatype);
+        }
+        match value {
+            Sp::Long(v) => {
+                key(&mut m, 11, 0);
+                varint(&mut m, *v);
+            }
+            Sp::Float(v) => {
+                key(&mut m, 12, 5);
+                m.extend_from_slice(&v.to_le_bytes());
+            }
+            Sp::Double(v) => {
+                key(&mut m, 13, 1);
+                m.extend_from_slice(&v.to_le_bytes());
+            }
+            Sp::Bool(v) => {
+                key(&mut m, 14, 0);
+                varint(&mut m, *v as u64);
+            }
+            Sp::Str(v) => {
+                key(&mut m, 15, 2);
+                varint(&mut m, v.len() as u64);
+                m.extend_from_slice(v.as_bytes());
+            }
+        }
+        key(&mut out, 2, 2);
+        varint(&mut out, m.len() as u64);
+        out.extend(m);
+    }
+    key(&mut out, 3, 0);
+    varint(&mut out, seq);
+    out
 }
 
 #[cfg(test)]
@@ -382,8 +570,10 @@ mod tests {
     fn two_sites_with_every_format_then_traffic() {
         let mut st = Store::new(10, 4 * 1024);
         let mut d = start(&mut st);
-        assert_eq!(st.conns.len(), 3);
-        let first = st.total();
+        assert_eq!(st.conns.len(), 4);
+        // Messages but plant's (Sparkplug B, whose metrics are topics too).
+        let total = |st: &Store| st.total() - st.nodes[st.conns[3].node].sub_msgs;
+        let first = total(&st);
         // online + 5 statuses + 11 samples + the SCADA snapshot, per site;
         // two machine states in acme's namespace
         assert_eq!(first, 2 * (1 + TURBINES + SAMPLES.len() + 1) as u64 + 2);
@@ -415,7 +605,7 @@ mod tests {
         assert!(xml.contains("site=\"bergen\""), "{}", &xml[..80]);
         // Telemetry and grid every second; alarm, fast log and status now and then.
         let per_second = 2 * (TURBINES + 2) as u64 + TAGS.len() as u64;
-        assert_eq!(st.total(), first + 13 * per_second + 2 * 3);
+        assert_eq!(total(&st), first + 13 * per_second + 2 * 3);
 
         // Then a spike, a stuck sensor and a silent turbine, each flagged.
         let flags = |st: &Store, topic: &str| {
@@ -455,6 +645,25 @@ mod tests {
         assert_eq!(flags(&st, "acme/oslo/packaging/line2/labeler/speed"), Some(Kind::Drift));
         // spike, stuck, 3 namespace problems, 2 drifts
         assert_eq!(st.flagged, 7);
+
+        // plant's Sparkplug B: births and data laid out as a namespace.
+        let plant = |st: &Store, path: &str| {
+            let n = st.find(3, path).unwrap_or_else(|| panic!("no {path}"));
+            String::from_utf8_lossy(&st.nodes[n].latest().unwrap().payload).into_owned()
+        };
+        assert_eq!(plant(&st, "@sparkplug/plant/gw1/press1/@state"), "online");
+        // A tool change from 50 s, running again from 58 s: by alias, named from the birth.
+        assert_eq!(plant(&st, "@sparkplug/plant/gw1/press1/Status"), "running");
+        assert!(
+            plant(&st, "@sparkplug/plant/gw1/press1/Hydraulics/Pressure")
+                .parse::<f64>()
+                .is_ok()
+        );
+        assert_eq!(plant(&st, "@sparkplug/plant/gw1/Properties/Firmware"), "2.4.1");
+        while d.step < 85 {
+            d.second(&mut st);
+        }
+        assert_eq!(plant(&st, "@sparkplug/plant/gw1/oven2/@state"), "offline");
     }
 
     #[test]

@@ -238,6 +238,16 @@ impl Watch {
         self.objects += 1;
     }
 
+    /// The JSON fields learnt, with their types.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.shape.iter().map(|f| (f.name.as_str(), f.kind))
+    }
+
+    /// Seconds between its messages, usually (once there were a few).
+    pub fn every(&self) -> Option<f64> {
+        (self.gaps.n >= 3).then_some(self.gaps.mean)
+    }
+
     /// What's wrong with the topic in its connection's unified namespace,
     /// if anything (found at `t`).
     pub fn set_uns(&mut self, problem: Option<String>, t: SystemTime) {

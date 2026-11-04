@@ -219,6 +219,7 @@ clears. Clearing keeps the tree open at the topic you were on.
 | tree, messages | `ctrl+t` / `ctrl+y` | copy the topic / the message (see [Clipboard](#clipboard)) |
 | full screen | `t` / `y` | copy the topic / what the view shows |
 | tree, messages | `ctrl+r` | capture this topic and everything below it to disk; again to stop |
+| anywhere | `ctrl+x` | export the selected branch (on a connection's row, all of it) as JSON and CSV (see [Exporting](#exporting-a-namespace)) |
 | anywhere | `ctrl+n` | with a newer release out: install it (see [Updating](#updating)); when a newer fss-mqtt was installed meanwhile: restart into it, continuing the session |
 | anywhere | `ctrl+c` | quit (saving the session for `--resume`) |
 
@@ -350,6 +351,11 @@ like one of these formats but can't be read, the reason is shown above a hex dum
   next one (edge nodes send one when a host application asks for a rebirth). All Sparkplug 3.0 types
   are shown, arrays, data sets and templates included; payloads compressed the way Eclipse Tahu does
   are unpacked first.
+
+  The metrics are also laid out as the namespace Sparkplug means, under `@sparkplug` in the
+  connection's tree: `@sparkplug/{group}/{edge node}/{device}/{metric}` (a metric's `/` makes levels
+  too), each with its latest value, and `@state` online or offline from births and deaths. They're
+  topics like any: in the values table, charted, watched for anomalies and exported.
 - **Avro:** container files are read with the schema in their header (uncompressed, Deflate, Snappy
   or Zstandard), nested values shown as compact JSON; Avro without its schema (Confluent
   schema-registry framing, single-object encoding) can't be decoded and says so.
@@ -450,6 +456,26 @@ its first numbers, or what it is. Flags show there too.
 
 The web version's `acme` connection is such a namespace, with a few topics that break it and two
 that drift now and then.
+
+## Exporting a namespace
+
+`ctrl+x` writes the topics at and below the selected node (a branch, an asset, or on a
+connection's row in the panel, the whole connection) to two files in the capture directory
+(`--capture-dir`, the current directory by default), `fss-mqtt-{connection}-{path}-{time}.json` and
+`.csv`; the web version downloads them. For each topic:
+
+| field | |
+|---|---|
+| `topic`, `levels` | its path, and its [unified namespace](#unified-namespace) levels |
+| `format`, `content_type` | what the payload is, and its content type |
+| `messages`, `retained`, `last`, `every_s` | how many arrived, whether retained, when the last did, the usual interval |
+| `value`, `unit`, `quality` | its latest value (see the values table) |
+| `fields` | its JSON payload's fields and their types, as learnt |
+| `flag` | what's flagged, if anything |
+| `example` | the latest payload, when it's text |
+
+The JSON also names the connection, its URL and levels, and when it was exported: a model of the
+namespace to document, review or compare.
 
 ## Capture to disk
 
@@ -591,9 +617,10 @@ connection and no async runtime, which keeps the binary around 1 MB. TLS uses ru
 ## Web version
 
 The web version at <https://mbilling.github.io/fss-mqtt/> is the same app built for the browser
-(WebAssembly), with the same keys, panes, viewer and charts. It starts with three demo connections
-whose data is made in the page (two wind-farm sites, and `acme`, a factory's
-[unified namespace](#unified-namespace)), and a live one to the public test broker
+(WebAssembly), with the same keys, panes, viewer and charts. It starts with four demo connections
+whose data is made in the page (two wind-farm sites; `acme`, a factory's
+[unified namespace](#unified-namespace); and `plant`, Sparkplug B from an edge node with a press and
+an oven), and a live one to the public test broker
 `wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics. That broker comes
 and goes: when it hasn't answered in 10 seconds, the page connects to EMQX's public broker
 (`wss://broker.emqx.io:8084/mqtt`) instead, subscribed to `fss-mqtt/#`, where what you publish

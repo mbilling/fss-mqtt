@@ -12,6 +12,19 @@ use web_time::SystemTime;
 
 use crate::capture::{Capture, Target};
 
+/// Where Sparkplug B metrics are, as topics of their own (see
+/// `Store::sparkplug_namespace`).
+pub const SPARKPLUG: &str = "@sparkplug";
+
+/// What's wrong with a topic in a unified namespace: nothing for the
+/// Sparkplug metrics fss-mqtt lays out itself.
+fn uns_problem(levels: &[String], path: &str) -> Option<String> {
+    if path.starts_with(SPARKPLUG) {
+        return None;
+    }
+    crate::uns::problem(levels, path)
+}
+
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Props {
     pub content_type: Option<String>,
@@ -379,6 +392,44 @@ impl Store {
         }
         if let Some(n) = self.insert(conn, topic, now, payload, payload.len(), qos, retain, props, decoded) {
             self.watch(n, now);
+            self.sparkplug_namespace(conn, topic, n, now);
+        }
+    }
+
+    /// A Sparkplug B message's metrics as topics of their own, under
+    /// `@sparkplug` as group › edge node › device › metric with its latest
+    /// value; and `@state`, online or offline, from births and deaths.
+    /// They're topics like any: in the tree, the values table, charts, the
+    /// watch and an export.
+    fn sparkplug_namespace(&mut self, conn: usize, topic: &str, n: usize, now: SystemTime) {
+        let Some((place, life)) = crate::sparkplug::place(topic) else {
+            return;
+        };
+        let base = format!("{SPARKPLUG}/{place}");
+        let state: &[u8] = match life {
+            crate::sparkplug::Life::Command => return,
+            crate::sparkplug::Life::Born => b"online",
+            crate::sparkplug::Life::Dead => b"offline",
+            crate::sparkplug::Life::Data => b"",
+        };
+        if !state.is_empty() {
+            let t = format!("{base}/@state");
+            let _ = self.insert(conn, &t, now, state, state.len(), 0, true, Props::default(), None);
+        }
+        let metrics = match self.nodes[n].latest().and_then(|m| m.decoded.as_deref()) {
+            Some(v) if life != crate::sparkplug::Life::Dead => crate::sparkplug::metrics(v),
+            _ => return,
+        };
+        for (name, value) in metrics {
+            let name = name.trim_matches('/');
+            if name.is_empty() {
+                continue;
+            }
+            let t = format!("{base}/{name}");
+            let v = value.as_bytes();
+            if let Some(m) = self.insert(conn, &t, now, v, v.len(), 0, false, Props::default(), None) {
+                self.watch(m, now);
+            }
         }
     }
 
@@ -403,7 +454,7 @@ impl Store {
         }
         if new {
             self.watched.push(n);
-            let problem = crate::uns::problem(&self.conns[node.conn].uns, &node.path);
+            let problem = uns_problem(&self.conns[node.conn].uns, &node.path);
             if let Some(w) = &mut self.nodes[n].watch {
                 w.set_uns(problem, now);
             }
@@ -424,7 +475,7 @@ impl Store {
             if self.nodes[n].conn != conn {
                 continue;
             }
-            let problem = crate::uns::problem(&self.conns[conn].uns, &self.nodes[n].path);
+            let problem = uns_problem(&self.conns[conn].uns, &self.nodes[n].path);
             if let Some(w) = &mut self.nodes[n].watch {
                 w.set_uns(problem, now);
             }
@@ -916,6 +967,56 @@ pub fn flatten(st: &Store, marks: Option<&[u8]>, expanded: &dyn Fn(usize, u8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparkplug_metrics_are_laid_out_as_a_namespace() {
+        let fixture = |name: &str| {
+            std::fs::read(format!(
+                "{}/tests/fixtures/sparkplug/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        let mut st = Store::new(10, 64 * 1024);
+        let c = st.add_conn("plant", "mqtt://x", None, vec![]);
+        let add = |st: &mut Store, topic: &str, file: &str| {
+            let p = fixture(file);
+            let v = st.conns[c].sparkplug.lock().unwrap().decode(topic, &p);
+            st.add_decoded(c, topic, &p, 0, false, Props::default(), v);
+        };
+        add(&mut st, "spBv1.0/Plant1/NBIRTH/Gateway1", "nbirth.bin");
+        add(&mut st, "spBv1.0/Plant1/DBIRTH/Gateway1/Meter3", "dbirth.bin");
+        add(&mut st, "spBv1.0/Plant1/DDATA/Gateway1/Meter3", "ddata.bin");
+        let value = |st: &Store, path: &str| {
+            let n = st.find(c, path).unwrap_or_else(|| panic!("no {path}"));
+            String::from_utf8(st.nodes[n].latest().unwrap().payload.clone()).unwrap()
+        };
+        assert_eq!(value(&st, "@sparkplug/Plant1/Gateway1/@state"), "online");
+        assert_eq!(value(&st, "@sparkplug/Plant1/Gateway1/Meter3/@state"), "online");
+        // Device metrics, named from the birth though the data gives aliases.
+        st.sort_children();
+        let meter = st.find(c, "@sparkplug/Plant1/Gateway1/Meter3").unwrap();
+        let names: Vec<String> = st.nodes[meter]
+            .children()
+            .iter()
+            .map(|&k| st.nodes[k].name.clone())
+            .collect();
+        assert!(names.len() > 2, "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("alias ")), "{names:?}");
+        // A death: offline.
+        add(&mut st, "spBv1.0/Plant1/NDEATH/Gateway1", "ndeath.bin");
+        assert_eq!(value(&st, "@sparkplug/Plant1/Gateway1/@state"), "offline");
+        // Not in a unified namespace's way: never flagged by it.
+        st.set_uns(c, vec!["enterprise".into(), "site".into()]);
+        let n = st.find(c, "@sparkplug/Plant1/Gateway1/@state").unwrap();
+        assert!(
+            st.nodes[n]
+                .watch
+                .as_ref()
+                .and_then(|w| w.flag(SystemTime::now()))
+                .is_none()
+        );
+    }
 
     fn store(topics: &[&str]) -> Store {
         let mut s = Store::new(3, 8);

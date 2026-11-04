@@ -358,6 +358,30 @@ fn on_keys(mut f: impl FnMut(WebKeyEvent) -> bool + 'static) {
     cb.forget(); // for as long as the page is open
 }
 
+/// Offers `text` to the browser as a file `name` to save (an export).
+pub fn download(name: &str, text: &str, mime: &str) {
+    use ratzilla::web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, Url};
+    let parts = js_sys::Array::of1(&text.into());
+    let opts = BlobPropertyBag::new();
+    opts.set_type(mime);
+    let Ok(blob) = Blob::new_with_str_sequence_and_options(&parts, &opts) else {
+        return;
+    };
+    let Ok(url) = Url::create_object_url_with_blob(&blob) else {
+        return;
+    };
+    let a = window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.create_element("a").ok())
+        .and_then(|e| e.dyn_into::<HtmlAnchorElement>().ok());
+    if let Some(a) = a {
+        a.set_href(&url);
+        a.set_download(name);
+        a.click();
+    }
+    let _ = Url::revoke_object_url(&url);
+}
+
 /// Runs `f` every `ms` milliseconds, for as long as the page is open.
 fn every(ms: i32, f: fn()) {
     let cb = Closure::<dyn FnMut()>::new(f);
