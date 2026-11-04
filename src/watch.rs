@@ -4,11 +4,18 @@
 //! changes but keeps repeating is stuck. The time between messages is kept
 //! the same way: a topic that publishes regularly and goes quiet is silent.
 //!
+//! A JSON object payload's shape (its fields and their types) is learnt
+//! too: a field changing type, one that was always there going, or a new
+//! one, is drift. And a topic that doesn't fit its connection's unified
+//! namespace (uns.rs) is flagged for as long as it's there.
+//!
 //! Each waits for enough messages to know what's usual, and the bounds are
 //! wide, so a flag is worth a look rather than noise. It's cheap: a few
 //! numbers per field, and constant time per message.
 
 use web_time::{Duration, SystemTime};
+
+use crate::json::Json;
 
 /// Values a field (or gaps a topic) needs before it's judged.
 const LEARN: u32 = 20;
@@ -26,14 +33,19 @@ const STUCK_REPEATS: u32 = 20;
 /// message (plus three times their spread), and at least `SILENT_MIN`.
 const SILENT_GAPS: f64 = 4.0;
 const SILENT_MIN: f64 = 5.0;
-/// The most fields a topic's watch keeps.
+/// The most fields a topic's watch keeps, of numbers and of its shape.
 const MAX_FIELDS: usize = 32;
+const MAX_SHAPE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Spike,
     Stuck,
     Silent,
+    /// The payload's shape changed.
+    Drift,
+    /// Not as the connection's unified namespace has it.
+    Uns,
 }
 
 impl Kind {
@@ -42,8 +54,58 @@ impl Kind {
             Kind::Spike => "spike",
             Kind::Stuck => "stuck",
             Kind::Silent => "silent",
+            Kind::Drift => "drift",
+            Kind::Uns => "uns",
         }
     }
+}
+
+/// A JSON object payload's fields, nested ones by their path ("meta.unit"),
+/// each with its type; `None` for any other payload.
+pub type Shape = Vec<(String, &'static str)>;
+
+pub fn shape(payload: &[u8]) -> Option<Shape> {
+    if payload.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let Ok(Json::Obj(fields)) = Json::parse(payload, 32) else {
+        return None;
+    };
+    fn walk(fields: &[(String, Json)], path: &str, out: &mut Shape) {
+        for (k, v) in fields {
+            let name = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}.{k}")
+            };
+            match v {
+                Json::Obj(inner) => walk(inner, &name, out),
+                _ if out.len() < MAX_SHAPE => out.push((name, type_of(v))),
+                _ => return,
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&fields, "", &mut out);
+    Some(out)
+}
+
+fn type_of(j: &Json) -> &'static str {
+    match j {
+        Json::Null => "null",
+        Json::Bool(_) => "boolean",
+        Json::Num(_) => "number",
+        Json::Str(_) => "string",
+        Json::Arr(_) => "array",
+        Json::Obj(_) => "object",
+    }
+}
+
+/// A field of the shape learnt: its type, and in how many messages it was.
+struct ShapeField {
+    name: String,
+    kind: &'static str,
+    seen: u32,
 }
 
 /// What looks wrong, and since when.
@@ -102,9 +164,94 @@ pub struct Watch {
     spike: Option<Flag>,
     stuck: Option<Flag>,
     silent: Option<Flag>,
+    /// The JSON shape learnt, and how many JSON object payloads taught it.
+    shape: Vec<ShapeField>,
+    objects: u32,
+    drift: Option<Flag>,
+    uns: Option<Flag>,
 }
 
 impl Watch {
+    /// A whole payload's shape (`None`: not a JSON object), as it came at
+    /// `t`. Once learnt, a change is drift; then it's the shape learnt.
+    pub fn shape(&mut self, t: SystemTime, now: Option<&Shape>) {
+        let Some(now) = now else {
+            if self.objects >= LEARN {
+                self.drift = Some(Flag {
+                    kind: Kind::Drift,
+                    what: "no longer a JSON object".into(),
+                    at: t,
+                });
+                self.objects = 0; // learn what it is now
+                self.shape.clear();
+            }
+            return;
+        };
+        if self.objects >= LEARN {
+            let mut changes = Vec::new();
+            for (name, kind) in now {
+                match self.shape.iter().find(|f| &f.name == name) {
+                    // A null stands in for any value.
+                    Some(f) if f.kind != *kind && *kind != "null" && f.kind != "null" => {
+                        changes.push(format!("{name}: {} → {kind}", f.kind));
+                    }
+                    Some(_) => {}
+                    None => changes.push(format!("new field {name}")),
+                }
+            }
+            for f in &self.shape {
+                if f.seen == self.objects && !now.iter().any(|(n, _)| n == &f.name) {
+                    changes.push(format!("{} gone", f.name));
+                }
+            }
+            if !changes.is_empty() {
+                let more = changes.len().saturating_sub(3);
+                changes.truncate(3);
+                let mut what = changes.join(", ");
+                if more > 0 {
+                    what += &format!(" and {more} more");
+                }
+                self.drift = Some(Flag {
+                    kind: Kind::Drift,
+                    what,
+                    at: t,
+                });
+            }
+        }
+        for (name, kind) in now {
+            match self.shape.iter().position(|f| &f.name == name) {
+                Some(i) => {
+                    let f = &mut self.shape[i];
+                    f.seen += 1;
+                    if *kind != "null" {
+                        f.kind = kind;
+                    }
+                }
+                None if self.shape.len() < MAX_SHAPE => self.shape.push(ShapeField {
+                    name: name.clone(),
+                    kind,
+                    seen: 1,
+                }),
+                None => {}
+            }
+        }
+        self.objects += 1;
+    }
+
+    /// What's wrong with the topic in its connection's unified namespace,
+    /// if anything (found at `t`).
+    pub fn set_uns(&mut self, problem: Option<String>, t: SystemTime) {
+        self.uns = match (problem, self.uns.take()) {
+            (Some(what), Some(was)) if was.what == what => Some(was),
+            (Some(what), _) => Some(Flag {
+                kind: Kind::Uns,
+                what,
+                at: t,
+            }),
+            (None, _) => None,
+        };
+    }
+
     /// A message at `t` with these numbers.
     pub fn arrive(&mut self, t: SystemTime, numbers: &[(String, f64)]) {
         if let Some(prev) = self.last
@@ -200,13 +347,16 @@ impl Watch {
         was != self.silent.is_some()
     }
 
-    /// What to flag at `now`: silent, else stuck, else a recent spike.
+    /// What to flag at `now`: silent, else stuck, else a recent drift or
+    /// spike, else what's wrong in the namespace.
     pub fn flag(&self, now: SystemTime) -> Option<&Flag> {
         let recent = |f: &&Flag| now.duration_since(f.at).map_or(true, |d| d < SPIKE_FOR);
         self.silent
             .as_ref()
             .or(self.stuck.as_ref())
+            .or(self.drift.as_ref().filter(recent))
             .or(self.spike.as_ref().filter(recent))
+            .or(self.uns.as_ref())
     }
 }
 
@@ -316,6 +466,60 @@ mod tests {
         assert_eq!(f.at, at(80.0), "since it was first flagged");
         w.arrive(at(82.0), &one("wind_ms", 9.1));
         assert!(w.flag(at(82.0)).is_none(), "moving again");
+    }
+
+    #[test]
+    fn a_payload_whose_shape_changes_drifts() {
+        let obj = |p: &str| shape(p.as_bytes());
+        assert_eq!(
+            obj(r#"{"value": 21.5, "unit": "C", "meta": {"ok": true, "n": null}}"#).unwrap(),
+            [
+                ("value".to_string(), "number"),
+                ("unit".to_string(), "string"),
+                ("meta.ok".to_string(), "boolean"),
+                ("meta.n".to_string(), "null")
+            ]
+        );
+        assert_eq!(obj("21.5"), None);
+        assert_eq!(obj("[1]"), None);
+
+        let mut w = Watch::default();
+        let ok = obj(r#"{"value": 21.5, "unit": "C", "note": null}"#);
+        for i in 0..LEARN {
+            w.shape(at(i as f64), ok.as_ref());
+        }
+        // A null where a number was isn't drift.
+        w.shape(at(20.0), obj(r#"{"value": null, "unit": "C", "note": "x"}"#).as_ref());
+        assert!(w.flag(at(20.0)).is_none());
+        // The number as a string.
+        w.shape(
+            at(21.0),
+            obj(r#"{"value": "21.5", "unit": "C", "note": null}"#).as_ref(),
+        );
+        let f = w.flag(at(21.0)).expect("drift");
+        assert_eq!((f.kind, f.what.as_str()), (Kind::Drift, "value: number → string"));
+        // Learnt: the same again isn't, until it changes once more.
+        w.shape(
+            at(22.0),
+            obj(r#"{"value": "21.5", "unit": "C", "note": null}"#).as_ref(),
+        );
+        assert_eq!(w.flag(at(22.0)).unwrap().at, at(21.0));
+        w.shape(at(23.0), obj(r#"{"value": "21.5", "note": null, "q": 1}"#).as_ref());
+        assert_eq!(w.flag(at(23.0)).unwrap().what, "new field q, unit gone");
+        assert!(w.flag(at(23.0) + SPIKE_FOR + Duration::from_secs(1)).is_none());
+        w.shape(at(24.0), None);
+        assert_eq!(w.flag(at(24.0)).unwrap().what, "no longer a JSON object");
+    }
+
+    #[test]
+    fn a_namespace_problem_stays_flagged_until_its_gone() {
+        let mut w = Watch::default();
+        w.set_uns(Some("missing the cell level".into()), at(0.0));
+        assert_eq!(w.flag(at(9999.0)).unwrap().kind, Kind::Uns);
+        w.set_uns(Some("missing the cell level".into()), at(5.0));
+        assert_eq!(w.flag(at(5.0)).unwrap().at, at(0.0), "since it was first found");
+        w.set_uns(None, at(6.0));
+        assert!(w.flag(at(6.0)).is_none());
     }
 
     #[test]

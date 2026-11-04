@@ -183,6 +183,8 @@ Just type — the tree updates on every keystroke and the cursor jumps to the fi
 - **Search** (anything else): case-insensitive substring over the full topic path; matches are
   underlined.
 - **`!`** alone: the topics with an [anomaly](#anomalies) flagged.
+- **`level=value`** (`site=oslo`): the topics whose [unified namespace](#unified-namespace) level of
+  that name starts with the value.
 
 `backspace` deletes a character, `ctrl+w` deletes back to the previous level, `esc`/`ctrl+u`
 clears. Clearing keeps the tree open at the topic you were on.
@@ -408,6 +410,10 @@ fss-mqtt watches every topic as its messages arrive and flags what doesn't look 
 - **stuck**: a number that usually changes has repeated one value 20 times (a frozen sensor).
 - **silent**: a topic that publishes regularly has said nothing for 4 of its usual intervals (and
   at least 5 seconds) while its connection is up.
+- **drift**: a JSON payload's shape changed: a field's type (`value: number → string`), a field that
+  was always there is gone, or a new one appeared. Flagged for 5 minutes; the new shape is then the
+  usual one.
+- **uns**: the topic doesn't fit its connection's [unified namespace](#unified-namespace).
 
 The numbers are those a chart would show: JSON fields, a number payload, Sparkplug metrics. Each
 check waits for 20 messages to learn what's usual first, and keeps a running mean and spread
@@ -415,6 +421,35 @@ weighted to about the last 30, so it costs a few numbers per field and nothing p
 noticing. A flagged topic says why in red in the tree (`! spike`), a collapsed branch how many it
 hides (`!2`), the header the total (`! 2 anomalies`), and its details the reason and since when.
 Type `!` to see only the flagged topics.
+
+## Unified namespace
+
+A connection can declare the levels of its unified namespace (UNS), topmost first:
+
+```toml
+[[connection]]
+name   = "factory"
+url    = "mqtt://uns.example.com"
+topics = ["acme/#"]
+uns    = ["enterprise", "site", "area", "line", "cell"]
+```
+
+Then:
+
+- **Each topic is checked** against it: it must have every level, and each level is lower case
+  letters, digits, `-` and `_`. One that doesn't is flagged `! uns` with the reason (`missing the
+  line and cell levels`, `area "Packaging Hall": lower case letters, digits, - and _ only`).
+- **Its details name the levels**: `enterprise acme · site oslo · area packaging · line line1`.
+- **`level=value` filters by a level**: `site=oslo`, `area=pack`, `line=` (any line). The value is a
+  prefix, as in patterns.
+
+On any connection, a branch's details list the **values** of every topic below it: a line, a cell
+or an asset as one table. A `{"value": …, "unit": …, "quality": …}` payload, as UNS tags often
+are, shows its value, unit and a quality other than good; any other shows a short text or number,
+its first numbers, or what it is. Flags show there too.
+
+The web version's `acme` connection is such a namespace, with a few topics that break it and two
+that drift now and then.
 
 ## Capture to disk
 
@@ -556,8 +591,9 @@ connection and no async runtime, which keeps the binary around 1 MB. TLS uses ru
 ## Web version
 
 The web version at <https://mbilling.github.io/fss-mqtt/> is the same app built for the browser
-(WebAssembly), with the same keys, panes, viewer and charts. It starts with two demo connections,
-whose wind-farm data is made in the page, and a live one to the public test broker
+(WebAssembly), with the same keys, panes, viewer and charts. It starts with three demo connections
+whose data is made in the page (two wind-farm sites, and `acme`, a factory's
+[unified namespace](#unified-namespace)), and a live one to the public test broker
 `wss://test.mosquitto.org:8081/mqtt`, subscribed to its `$SYS/#` statistics. That broker comes
 and goes: when it hasn't answered in 10 seconds, the page connects to EMQX's public broker
 (`wss://broker.emqx.io:8084/mqtt`) instead, subscribed to `fss-mqtt/#`, where what you publish

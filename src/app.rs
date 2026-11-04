@@ -1452,6 +1452,7 @@ impl App {
             let idx = st.add_conn(&c.name, &display, c.username.clone(), subs_of(&c));
             debug_assert_eq!(idx, i);
             st.conns[idx].capture.set_rules(&c.capture, &c.capture_paused);
+            st.set_uns(idx, c.uns.clone());
             st.conns[idx].node
         };
         self.expanded.insert(node);
@@ -1495,7 +1496,9 @@ impl App {
             let before = std::mem::replace(&mut c.subs, subs);
             c.url = display;
             c.username = new.username.clone();
-            (c.status.state, before)
+            let state = c.status.state;
+            st.set_uns(i, new.uns.clone());
+            (state, before)
         };
         if old.capture != new.capture || old.capture_paused != new.capture_paused {
             {

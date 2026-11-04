@@ -44,6 +44,7 @@ mod sqlite;
 mod store;
 mod theme;
 mod ui;
+mod uns;
 mod update;
 mod upgrade;
 mod values;

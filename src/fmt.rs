@@ -17,6 +17,16 @@ pub fn human_bytes(n: usize) -> String {
     }
 }
 
+/// A number as a reading shows it: whole if it is, else up to three
+/// decimals (21.53, 1234.5, 0.004).
+pub fn number(x: f64) -> String {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        return format!("{x:.0}");
+    }
+    let s = format!("{x:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 pub fn human_count(n: u64) -> String {
     if n < 10_000 {
         commas(n)

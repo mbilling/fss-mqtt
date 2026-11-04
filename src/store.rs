@@ -159,6 +159,8 @@ pub struct ConnInfo {
     /// Sparkplug B metric names from the births seen, shared with the
     /// connection's thread (which decodes) and saved with a session.
     pub sparkplug: Arc<Mutex<crate::sparkplug::Aliases>>,
+    /// Its unified namespace's levels, if it has one (uns.rs).
+    pub uns: Vec<String>,
 }
 
 /// A capture or session file shown as a connection: read once, never connected.
@@ -296,6 +298,7 @@ impl Store {
             capture: Capture::default(),
             file: None,
             sparkplug: Default::default(),
+            uns: Vec::new(),
         });
         idx
     }
@@ -384,15 +387,49 @@ impl Store {
         // A big payload's numbers are a table's, for its chart.
         const NUMBERS_UP_TO: usize = 16 * 1024;
         let node = &mut self.nodes[n];
-        let numbers = match node.msgs.back() {
-            Some(m) if m.size <= NUMBERS_UP_TO => crate::chart::fields(m),
-            _ => vec![],
+        let (numbers, shape) = match node.msgs.back() {
+            Some(m) if m.size <= NUMBERS_UP_TO => {
+                // The shape of a whole payload only: a cut one isn't JSON.
+                let whole = m.payload.len() == m.size;
+                (crate::chart::fields(m), whole.then(|| crate::watch::shape(&m.payload)))
+            }
+            _ => (vec![], None),
         };
-        if node.watch.is_none() {
-            self.watched.push(n);
+        let new = node.watch.is_none();
+        let w = node.watch.get_or_insert_default();
+        w.arrive(now, &numbers);
+        if let Some(shape) = &shape {
+            w.shape(now, shape.as_ref());
         }
-        node.watch.get_or_insert_default().arrive(now, &numbers);
+        if new {
+            self.watched.push(n);
+            let problem = crate::uns::problem(&self.conns[node.conn].uns, &node.path);
+            if let Some(w) = &mut self.nodes[n].watch {
+                w.set_uns(problem, now);
+            }
+        }
         self.reflag(n, now);
+    }
+
+    /// Connection `conn`'s unified namespace (no levels: none), its topics
+    /// checked against it again.
+    pub fn set_uns(&mut self, conn: usize, levels: Vec<String>) {
+        if self.conns[conn].uns == levels {
+            return;
+        }
+        self.conns[conn].uns = levels;
+        let now = SystemTime::now();
+        for i in 0..self.watched.len() {
+            let n = self.watched[i];
+            if self.nodes[n].conn != conn {
+                continue;
+            }
+            let problem = crate::uns::problem(&self.conns[conn].uns, &self.nodes[n].path);
+            if let Some(w) = &mut self.nodes[n].watch {
+                w.set_uns(problem, now);
+            }
+            self.reflag(n, now);
+        }
     }
 
     /// Looks again at what the watches flag at `now`: topics gone quiet,
@@ -636,6 +673,9 @@ pub enum FilterMode {
     Pattern,
     /// `!`: the topics with a flag up (see watch.rs).
     Flagged,
+    /// `level=value` (`site=oslo`): the topics whose unified namespace level
+    /// of that name starts with the value (uns.rs).
+    Level,
 }
 
 #[derive(Clone)]
@@ -643,6 +683,8 @@ pub struct Filter {
     pub mode: FilterMode,
     segs: Vec<String>,
     q: String,
+    /// The level's name, for `Level`.
+    level: String,
 }
 
 pub const VISIBLE: u8 = 1;
@@ -655,10 +697,19 @@ impl Filter {
             FilterMode::None
         } else if raw == "!" {
             FilterMode::Flagged
+        } else if !raw.contains('/')
+            && let Some((name, _)) = raw.split_once('=')
+            && crate::uns::valid_level(name)
+        {
+            FilterMode::Level
         } else if raw.contains(['/', '+', '#']) {
             FilterMode::Pattern
         } else {
             FilterMode::Search
+        };
+        let (level, value) = match (mode, raw.split_once('=')) {
+            (FilterMode::Level, Some((l, v))) => (l.to_string(), v),
+            _ => (String::new(), raw),
         };
         Filter {
             mode,
@@ -667,7 +718,8 @@ impl Filter {
             } else {
                 vec![]
             },
-            q: raw.to_lowercase(),
+            q: value.to_lowercase(),
+            level,
         }
     }
 
@@ -687,6 +739,11 @@ impl Filter {
             if self.mode == FilterMode::Flagged {
                 if v.flagged(c) {
                     v.marks[c] |= VISIBLE;
+                }
+            } else if self.mode == FilterMode::Level {
+                let levels = &st.conns[st.nodes[c].conn].uns;
+                if let Some(k) = levels.iter().position(|l| *l == self.level) {
+                    v.level(c, k);
                 }
             } else if self.mode == FilterMode::Search {
                 let mut any = false;
@@ -727,6 +784,24 @@ impl Visitor<'_> {
             self.marks[c] |= m;
             self.inside(c);
         }
+    }
+
+    /// The topics below `n` whose level `k` below it starts with the
+    /// value, and the way to them.
+    fn level(&mut self, n: usize, k: usize) -> bool {
+        let mut any = false;
+        for &c in self.st.nodes[n].children() {
+            if k > 0 {
+                any |= self.level(c, k - 1);
+            } else if self.st.nodes[c].lower_name.starts_with(&self.f.q) {
+                self.match_subtree(c);
+                any = true;
+            }
+        }
+        if any {
+            self.marks[n] |= VISIBLE;
+        }
+        any
     }
 
     /// Flagged topics, and the way to them.

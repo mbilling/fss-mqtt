@@ -606,7 +606,7 @@ fn node_name<'a>(app: &App, name: &str, mark: u8, sel: bool) -> Vec<Span<'a>> {
     if mark & MATCHED == 0 {
         return vec![Span::styled(name.to_string(), base)];
     }
-    if app.filter.mode == FilterMode::Pattern {
+    if matches!(app.filter.mode, FilterMode::Pattern | FilterMode::Level) {
         return vec![Span::styled(name.to_string(), th.matched)];
     }
     // Search: underline each occurrence of the query.
@@ -665,7 +665,7 @@ fn detail_box(buf: &mut Buffer, r: Rect, app: &App, st: &Store, stacked: bool) {
     } else if node.has_messages() {
         topic_detail(app, st, n, iw, ih)
     } else {
-        (branch_detail(app, st, n, iw), None)
+        (branch_values(app, st, n, iw, ih), None)
     };
     lines.truncate(ih);
     let focused = app.focus == Focus::Msgs;
@@ -705,6 +705,7 @@ fn topic_detail<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> (Vec
         ));
     }
     out.push(Line::from(meta));
+    out.extend(uns_line(app, st, n));
     // What its watch flags, and since when.
     if let Some(f) = node.watch.as_ref().and_then(|w| w.flag(app.now)) {
         out.push(Line::from(vec![
@@ -1060,6 +1061,190 @@ fn conn_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
     out
 }
 
+/// A branch's details: its counts, the namespace levels it fills, and a
+/// table of every value below it (as many as fit in `h` lines).
+fn branch_values<'a>(app: &App, st: &Store, n: usize, w: usize, h: usize) -> Vec<Line<'a>> {
+    let th = &app.th;
+    let node = &st.nodes[n];
+    let mut out = vec![Line::styled(
+        format!(
+            "{} · {} · {} · last {}",
+            plural(node.topics as usize, "topic", "topics"),
+            msg_count(node.sub_msgs),
+            plural(node.num_children(), "child", "children"),
+            ago(app.now, node.last_seen)
+        ),
+        th.dim,
+    )];
+    out.extend(uns_line(app, st, n));
+    out.push(Line::default());
+    out.push(Line::styled("Values", th.section));
+    // Every topic below, in the tree's order: as many as fit, and a count.
+    let room = h.saturating_sub(out.len() + 1).max(1);
+    let mut tags = Vec::new();
+    let mut total = 0;
+    let mut stack = vec![n];
+    while let Some(i) = stack.pop() {
+        let t = &st.nodes[i];
+        if i != n && t.has_messages() {
+            total += 1;
+            if tags.len() < room {
+                tags.push(i);
+            }
+        }
+        stack.extend(t.children().iter().rev());
+    }
+    let rows: Vec<_> = tags
+        .iter()
+        .map(|&i| {
+            let t = &st.nodes[i];
+            let tag = t.path[node.path.len()..].trim_start_matches('/').to_string();
+            let v = t.latest().map(|m| value_of(m)).unwrap_or_default();
+            (i, tag, v)
+        })
+        .collect();
+    let tw = rows
+        .iter()
+        .map(|r| fmt::str_width(&r.1))
+        .max()
+        .unwrap_or(0)
+        .min(w * 2 / 5);
+    let vw = rows
+        .iter()
+        .map(|r| fmt::str_width(&r.2.value))
+        .max()
+        .unwrap_or(0)
+        .min(16);
+    let uw = rows
+        .iter()
+        .filter_map(|r| r.2.unit.as_deref())
+        .map(fmt::str_width)
+        .max()
+        .unwrap_or(0)
+        .min(8);
+    for (i, tag, v) in rows {
+        let t = &st.nodes[i];
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::styled(fmt::pad(&fmt::trunc_left(&tag, tw), tw), th.text),
+            Span::raw("  "),
+        ];
+        if v.plain {
+            spans.push(Span::styled(
+                format!("{:>vw$}", fmt::one_line(v.value.as_bytes(), vw)),
+                th.value,
+            ));
+        } else {
+            spans.push(Span::styled(v.value.clone(), th.faint));
+        }
+        if uw > 0 {
+            let u = v.unit.as_deref().unwrap_or("");
+            spans.push(Span::styled(format!(" {}", fmt::pad(u, uw)), th.dim));
+        }
+        if let Some(q) = v.quality.as_ref().filter(|q| !q.eq_ignore_ascii_case("good")) {
+            spans.push(Span::styled(format!("  {q}"), th.yellow));
+        }
+        if let Some(m) = t.latest() {
+            spans.push(Span::styled(format!("  {}", ago(app.now, m.time)), th.faint));
+        }
+        if let Some(f) = t.watch.as_ref().and_then(|w| w.flag(app.now)) {
+            spans.push(Span::styled(format!("  ! {}", f.kind.name()), th.red));
+        }
+        out.push(Line::from(spans));
+    }
+    if total > tags.len() {
+        out.push(Line::styled(format!("  … {} more below", total - tags.len()), th.faint));
+    }
+    out
+}
+
+/// A topic's value as the values table shows it.
+#[derive(Default)]
+struct Value {
+    value: String,
+    /// A value of its own (not a summary of the payload): right-aligned.
+    plain: bool,
+    unit: Option<String>,
+    quality: Option<String>,
+}
+
+/// What a message says, in a word or two: a `{"value", "unit",
+/// "quality"}` object's (as a unified namespace's tags often are), a short
+/// text or number, the first numbers a JSON payload carries, or else what
+/// it is and its size.
+fn value_of(m: &crate::store::Message) -> Value {
+    let quality = m
+        .props
+        .user
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("quality"))
+        .map(|(_, v)| v.clone());
+    let text = |j: &crate::json::Json| match j {
+        crate::json::Json::Str(s) => Some(s.clone()),
+        crate::json::Json::Num(n) => Some(fmt::number(*n)),
+        crate::json::Json::Bool(b) => Some(b.to_string()),
+        _ => None,
+    };
+    if m.payload.len() == m.size
+        && let Ok(j @ crate::json::Json::Obj(_)) = crate::json::Json::parse(&m.payload, 8)
+    {
+        let first = |keys: &[&str]| keys.iter().find_map(|k| j.get(k)).and_then(text);
+        if let Some(value) = first(&["value", "val", "v"]) {
+            return Value {
+                value,
+                plain: true,
+                unit: first(&["unit", "units", "eng_unit", "engUnit", "uom"]),
+                quality: first(&["quality", "q"]).or(quality),
+            };
+        }
+        let nums = crate::chart::fields(m);
+        if !nums.is_empty() {
+            let shown: Vec<String> = nums
+                .iter()
+                .take(3)
+                .map(|(k, v)| format!("{k} {}", fmt::number(*v)))
+                .collect();
+            return Value {
+                value: shown.join(" · "),
+                quality,
+                ..Default::default()
+            };
+        }
+    }
+    if m.size <= 32 && fmt::is_text(&m.payload) {
+        return Value {
+            value: String::from_utf8_lossy(&m.payload).trim().to_string(),
+            plain: true,
+            quality,
+            ..Default::default()
+        };
+    }
+    Value {
+        value: format!("{} · {}", crate::pretty::detect(m).label(), human_bytes(m.size)),
+        quality,
+        ..Default::default()
+    }
+}
+
+/// "enterprise acme · site oslo · area packaging": the unified namespace
+/// levels a topic or branch fills, if its connection has one.
+fn uns_line<'a>(app: &App, st: &Store, n: usize) -> Option<Line<'a>> {
+    let node = &st.nodes[n];
+    let levels = &st.conns[node.conn].uns;
+    if levels.is_empty() || node.is_conn() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (i, (name, value)) in crate::uns::levels(levels, &node.path).into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", app.th.faint));
+        }
+        spans.push(Span::styled(format!("{name} "), app.th.dim));
+        spans.push(Span::styled(value.to_string(), app.th.text));
+    }
+    Some(Line::from(spans))
+}
+
 fn branch_detail<'a>(app: &App, st: &Store, n: usize, w: usize) -> Vec<Line<'a>> {
     let th = &app.th;
     let node = &st.nodes[n];
@@ -1124,6 +1309,10 @@ fn input_box(buf: &mut Buffer, r: Rect, app: &App) {
         ],
         FilterMode::Flagged => vec![
             Span::styled("flagged · ", th.dim),
+            Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
+        ],
+        FilterMode::Level => vec![
+            Span::styled("level · ", th.dim),
             Span::styled(plural(app.matched as usize, "topic", "topics"), th.text),
         ],
         FilterMode::None => vec![],
@@ -3231,6 +3420,66 @@ mod tests {
         typ(&mut app, " ");
         assert_eq!(sent(&rxs[0]), ["-v1/#"]);
         assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn a_unified_namespace_its_values_levels_and_problems() {
+        let mut st = Store::new(10, 64 * 1024);
+        let c = st.add_conn("acme", "mqtt://x", None, vec![sub("acme/#")]);
+        st.conns[c].status.state = ConnState::Connected;
+        st.set_uns(
+            c,
+            ["enterprise", "site", "area", "line", "cell"]
+                .map(String::from)
+                .to_vec(),
+        );
+        let json = |v: &str, unit: &str, q: &str| format!("{{\"value\":{v},\"unit\":\"{unit}\",\"quality\":\"{q}\"}}");
+        for (topic, p) in [
+            ("acme/oslo/packaging/line1/filler/speed", json("401.5", "bpm", "Good")),
+            (
+                "acme/oslo/packaging/line1/filler/temperature",
+                json("4.82", "°C", "Good"),
+            ),
+            (
+                "acme/oslo/packaging/line1/capper/torque",
+                json("2.1", "Nm", "Uncertain"),
+            ),
+            ("acme/oslo/packaging/line1/filler/state", "running".to_string()),
+            ("acme/bergen/brewing/line1/mash_tun/level", json("72", "%", "Good")),
+            ("acme/bergen/energy", json("350", "kW", "Good")),
+        ] {
+            st.add_decoded(c, topic, p.as_bytes(), 0, false, Props::default(), None);
+        }
+        let (mut app, _rx) = app_with(st, tmp_config("uns"));
+
+        // A line's values: every tag below it, with its unit and quality.
+        typ(&mut app, "acme/oslo/packaging/line1");
+        let v = frame(&app, "line1 values");
+        assert!(
+            v.contains("enterprise acme · site oslo · area packaging · line line1"),
+            "{v}"
+        );
+        assert!(v.contains("Values"), "{v}");
+        for want in ["filler/speed", "401.5 bpm", "4.82 °C", "running", "2.1 Nm   Uncertain"] {
+            assert!(v.contains(want), "{want}: {v}");
+        }
+
+        // level=value: the topics at that level of the namespace.
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "site=bergen");
+        let v = frame(&app, "site=bergen");
+        assert!(v.contains("level · 2 topics"), "{v}");
+        assert!(
+            v.contains("brewing") && v.contains("energy") && !v.contains("packaging"),
+            "{v}"
+        );
+
+        // A topic three levels deep: flagged, and why.
+        press(&mut app, &[KeyCode::Esc]);
+        typ(&mut app, "!");
+        let v = frame(&app, "flagged");
+        assert!(v.contains("energy ! uns"), "{v}");
+        assert!(v.contains("! uns missing the line and cell levels"), "{v}");
     }
 
     #[test]

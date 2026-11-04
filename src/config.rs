@@ -20,6 +20,12 @@
 //! headers_env  = ["CF-Access-Client-Secret: CF_SECRET"] # the value from $CF_SECRET
 //! proxy        = "http://alice@proxy.corp:8080"         # or socks5://host:port
 //! proxy_password_env = "PROXY_PW"                       # alice's password
+//!
+//! [[connection]]
+//! name         = "factory"
+//! url          = "mqtt://uns.example.com"
+//! topics       = ["acme/#"]
+//! uns          = ["enterprise", "site", "area", "line", "cell"]  # its levels (uns.rs)
 //! ```
 //!
 //! Passwords are never written to the file. Saving an entry rewrites only that
@@ -50,6 +56,8 @@ pub struct ConnCfg {
     /// "Name: VAR" for a value read from the environment variable VAR.
     pub headers: Vec<String>,
     pub headers_env: Vec<String>,
+    /// A unified namespace's levels, topmost first (see uns.rs).
+    pub uns: Vec<String>,
     /// A proxy to reach the broker through (proxy.rs), and the environment
     /// variable with its user's password.
     pub proxy: Option<String>,
@@ -188,6 +196,9 @@ pub(crate) fn render(c: &ConnCfg) -> String {
     }
     if !c.headers_env.is_empty() {
         kv("headers_env", list(&c.headers_env));
+    }
+    if !c.uns.is_empty() {
+        kv("uns", list(&c.uns));
     }
     kv("autoconnect", c.autoconnect.to_string());
     s
@@ -473,6 +484,17 @@ fn set(c: &mut ConnCfg, key: &str, v: Value) -> Result<(), String> {
                 c.headers_env = l;
             }
         }
+        "uns" => {
+            let Value::List(l) = v else {
+                return Err("uns must be a list of level names".into());
+            };
+            if let Some(bad) = l.iter().find(|n| !crate::uns::valid_level(n)) {
+                return Err(format!(
+                    "uns: {bad:?} is not a level name (lower case letters, digits, - and _)"
+                ));
+            }
+            c.uns = l;
+        }
         "topics" | "paused" | "capture" | "capture_paused" => {
             let Value::List(l) = v else {
                 return Err(format!("{key} must be a list of strings"));
@@ -556,6 +578,21 @@ topics = ["#"]
         assert!(parse("[[connection]]\nname = \"a\"").unwrap_err().contains("no url"));
         let e = parse("[[connection]]\nname = \"a\"\nurl = \"mqtt://x\"\ncapture = [\"a/#/b\"]").unwrap_err();
         assert!(e.contains("line 4") && e.contains("not a topic filter"), "{e}");
+    }
+
+    #[test]
+    fn uns_levels() {
+        let c =
+            &parse("[[connection]]\nname = \"f\"\nurl = \"mqtt://h\"\nuns = [\"enterprise\", \"site\", \"area\"]\n")
+                .unwrap()[0];
+        assert_eq!(c.uns, ["enterprise", "site", "area"]);
+        assert!(
+            render(c).contains("uns          = [\"enterprise\", \"site\", \"area\"]"),
+            "{}",
+            render(c)
+        );
+        let bad = parse("[[connection]]\nname = \"f\"\nurl = \"mqtt://h\"\nuns = [\"Site\"]\n").unwrap_err();
+        assert!(bad.contains("not a level name"), "{bad}");
     }
 
     #[test]
