@@ -483,6 +483,7 @@ fn run() -> Result<(), String> {
             let mut st = store.lock().unwrap();
             let idx = st.add_conn(&e.name, &display, e.username.clone(), app::subs_of(e));
             st.conns[idx].capture.set_rules(&e.capture, &e.capture_paused);
+            st.set_uns(idx, e.uns.clone());
             idx
         };
         debug_assert_eq!(idx, i);

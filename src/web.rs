@@ -83,7 +83,8 @@ pub fn main() {
                     cfg: ConnCfg {
                         name: c.name.clone(),
                         url: c.url.clone(),
-                        topics: vec!["site/#".into()],
+                        topics: c.subs.iter().map(|s| s.topic.clone()).collect(),
+                        uns: c.uns.clone(),
                         ..Default::default()
                     },
                     saved: false,
