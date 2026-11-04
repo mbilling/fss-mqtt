@@ -46,9 +46,12 @@ certfile $dir/server.pem
 keyfile $dir/server.key
 require_certificate true
 CONF
-# Absolute: a newer mosquitto reads -c relative to elsewhere when it runs as a daemon.
-mosquitto -d -c "$dir/plain.conf"
-mosquitto -d -c "$dir/tls.conf"
-mosquitto -d -c "$dir/mtls.conf"
+# A copy of mosquitto, run from here: Ubuntu (26.04 on) confines the packaged
+# /usr/sbin/mosquitto with AppArmor to its own files, and it couldn't open
+# these. The profile goes by the binary's path.
+cp "$(command -v mosquitto)" "$dir/mosquitto"
+"$dir/mosquitto" -d -c "$dir/plain.conf"
+"$dir/mosquitto" -d -c "$dir/tls.conf"
+"$dir/mosquitto" -d -c "$dir/mtls.conf"
 sleep 1
 echo "brokers up; CA at $dir/ca.pem"
