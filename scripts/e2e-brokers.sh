@@ -46,8 +46,9 @@ certfile $dir/server.pem
 keyfile $dir/server.key
 require_certificate true
 CONF
-mosquitto -d -c plain.conf
-mosquitto -d -c tls.conf
-mosquitto -d -c mtls.conf
+# Absolute: a newer mosquitto reads -c relative to elsewhere when it runs as a daemon.
+mosquitto -d -c "$dir/plain.conf"
+mosquitto -d -c "$dir/tls.conf"
+mosquitto -d -c "$dir/mtls.conf"
 sleep 1
 echo "brokers up; CA at $dir/ca.pem"
