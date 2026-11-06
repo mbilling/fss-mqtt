@@ -28,6 +28,25 @@ scoop install fss-mqtt
 The Linux binaries are static and run on any distribution. winget isn't set up yet
 (see [RELEASING.md](RELEASING.md)).
 
+### Arch Linux (pacman)
+
+fss-mqtt has its own pacman repository, for x86_64 and aarch64 (Arch Linux ARM). Trust its signing
+key once, add it to `/etc/pacman.conf`, and install:
+
+```sh
+curl -fsSL https://mbilling.github.io/fss-mqtt/arch/fss-mqtt.asc | sudo pacman-key --add -
+sudo pacman-key --lsign-key 62F75F6CCD2AFB6BC7C7DC436261829B8C18A370
+```
+```ini
+[fss-mqtt]
+Server = https://mbilling.github.io/fss-mqtt/arch/$arch
+```
+```sh
+sudo pacman -Sy fss-mqtt
+```
+
+Updates come with `pacman -Syu`. The same is on <https://mbilling.github.io/fss-mqtt/arch/>.
+
 ### OmaMQTT (Omarchy)
 
 ![OmaMQTT in Omarchy's Tokyo Night theme: browsing two brokers and charting a topic's numbers; partway through, Omarchy switches to its Osaka Jade theme and OmaMQTT's colours follow; the keys pressed show below](docs/omamqtt.gif)

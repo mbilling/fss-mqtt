@@ -1,7 +1,8 @@
 name: Web
 
 # The web version (src/web.rs) on GitHub Pages: built on pull requests that
-# touch it, published with each release (and by hand).
+# touch it, published with each release (and by hand). The pacman repository
+# (packaging/arch) is published with it, under /arch.
 
 on:
   push:
@@ -11,6 +12,7 @@ on:
       - "src/**"
       - "web/**"
       - "Cargo.*"
+      - "packaging/arch/**"
       - ".github/workflows/web.yml"
   workflow_dispatch:
 
@@ -30,6 +32,8 @@ jobs:
   build:
     name: build (trunk)
     runs-on: ubuntu-latest
+    # A tag's pacman repository waits for its release's builds.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -50,6 +54,36 @@ jobs:
         run: |
           size=$(stat -c %s dist/*.wasm)
           echo "Web version: $((size / 1024)) KiB of wasm" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Pacman repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH_GPG_KEY: ${{ secrets.ARCH_GPG_KEY }}
+        run: |
+          # The release: this tag's, or (by hand, or on a PR) the latest.
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            tag=${GITHUB_REF#refs/tags/}
+          else
+            tag=$(gh release view --json tagName -q .tagName)
+          fi
+          # A tag's release is being built alongside: wait for its checksums.
+          for _ in $(seq 1 90); do
+            gh release download "$tag" -p SHA256SUMS -O SHA256SUMS --clobber 2>/dev/null && break
+            sleep 20
+          done
+          test -s SHA256SUMS
+          docker run --rm -e ARCH_GPG_KEY -v "$PWD:/src" -w /src archlinux:base-devel bash -c '
+            set -euo pipefail
+            if [ -n "$ARCH_GPG_KEY" ]; then
+              printf "%s\n" "$ARCH_GPG_KEY" | gpg --batch --import
+              export GPGKEY=$(gpg --list-secret-keys --with-colons | awk -F: "/^fpr/ { print \$10; exit }")
+            fi
+            packaging/arch/build-repo.sh "${1#v}" SHA256SUMS dist/arch
+          ' _ "$tag"
+          if [ -z "$ARCH_GPG_KEY" ]; then
+            echo "Pacman repository for $tag: **unsigned** (no ARCH_GPG_KEY secret)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pacman repository for $tag: signed" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-pages-artifact@v5
         if: github.event_name != 'pull_request' # nothing deploys a PR's
         with:
