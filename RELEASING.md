@@ -69,6 +69,26 @@ builds the release's source and installs the program as `/usr/bin/omamqtt` (not 
 `packaging/omarchy/omamqtt.desktop` and `omamqtt.svg` from it. Changing any of those means
 changing the recipe too.
 
+### Arch Linux (fss-mqtt's own pacman repository)
+
+The Web workflow publishes a pacman repository with the web version on GitHub Pages, at
+`https://mbilling.github.io/fss-mqtt/arch/$arch` (x86_64 and aarch64), on each release tag:
+`packaging/arch/build-repo.sh` packages the release's static Linux builds with
+`packaging/arch/PKGBUILD` in an Arch Linux container, and makes each architecture's database with
+`repo-add`. A release needs nothing more.
+
+Packages and databases are signed with a GPG key kept in the `ARCH_GPG_KEY` secret (armored, without
+a passphrase; without the secret the repository is published unsigned, and the run's summary says
+so). The key, once:
+
+```sh
+gpg --batch --passphrase '' --quick-gen-key "fss-mqtt packages" ed25519 sign never
+gpg --armor --export-secret-keys "fss-mqtt packages" | gh secret set ARCH_GPG_KEY -R <owner>/fss-mqtt
+gpg --fingerprint "fss-mqtt packages"   # the README's pacman-key --lsign-key
+```
+
+Keep a backup of it: a new key means every user trusting it again.
+
 ### winget (Windows)
 
 winget packages live in [microsoft/winget-pkgs](https://github.com/microsoft/winget-pkgs) and every

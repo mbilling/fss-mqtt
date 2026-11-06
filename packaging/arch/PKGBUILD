@@ -1,0 +1,26 @@
+# Maintainer: Michael Frost Billing <michael dot frost dot billing at gmail dot com>
+#
+# fss-mqtt's own pacman repository (see build-repo.sh): the static Linux
+# build from the GitHub release, for x86_64 and aarch64 (Arch Linux ARM).
+# build-repo.sh sets pkgver and the checksums for each release.
+
+pkgname=fss-mqtt
+pkgver=0.16.0
+pkgrel=1
+pkgdesc='Keyboard-driven MQTT v5 explorer for the terminal'
+arch=('x86_64' 'aarch64')
+url='https://github.com/mbilling/fss-mqtt'
+license=('MIT OR Apache-2.0')
+options=('!strip' '!debug')
+source_x86_64=("$url/releases/download/v$pkgver/$pkgname-$pkgver-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/$pkgname-$pkgver-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('072c9210d2719adca111f1e40b886a3976a19637ac403ea93983021eae9a765f')
+sha256sums_aarch64=('d993d767b7f850eae1d90cca594de0eeeb30f2636e5c1925cbfb5c0c951da7ad')
+
+package() {
+  cd "$pkgname-$pkgver-$CARCH-unknown-linux-musl"
+
+  install -Dm755 fss-mqtt -t "$pkgdir/usr/bin"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname"
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname"
+}
